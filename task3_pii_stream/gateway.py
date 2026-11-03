@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 import httpx
@@ -37,8 +38,16 @@ log = logging.getLogger("pii-gateway")
 PROVIDER_URL = os.environ.get("PROVIDER_URL", "http://127.0.0.1:9100/v1/chat/completions")
 PROVIDER_KEY = os.environ.get("PROVIDER_API_KEY", "")
 
-app = FastAPI(title="LLM Gateway — PII streaming guardrail")
 client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=5.0))
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield
+    await client.aclose()
+
+
+app = FastAPI(title="LLM Gateway — PII streaming guardrail", lifespan=lifespan)
 
 
 def sse(obj: dict | str) -> bytes:
@@ -60,6 +69,9 @@ async def redacted_stream(upstream: httpx.Response) -> AsyncIterator[bytes]:
                 evt = json.loads(data)
             except json.JSONDecodeError:
                 log.warning("dropping malformed upstream SSE line")
+                continue
+            if not isinstance(evt, dict):
+                log.warning("dropping non-object upstream SSE event")
                 continue
             last_meta = {k: evt.get(k) for k in ("id", "object", "created", "model")}
             kept = []
@@ -104,7 +116,14 @@ async def redacted_stream(upstream: httpx.Response) -> AsyncIterator[bytes]:
 
 @app.post("/v1/chat/completions")
 async def completions(req: Request):
-    body = await req.json()
+    try:
+        body = await req.json()
+    except ValueError:
+        return JSONResponse({"error": {"type": "invalid_request_error", "message": "Body is not valid JSON"}},
+                            status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": {"type": "invalid_request_error", "message": "Body must be a JSON object"}},
+                            status_code=400)
     headers = {"Authorization": f"Bearer {PROVIDER_KEY}"} if PROVIDER_KEY else {}
     try:
         upstream = await client.send(

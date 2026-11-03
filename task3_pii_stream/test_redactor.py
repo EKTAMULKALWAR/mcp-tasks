@@ -95,3 +95,86 @@ async def test_no_content_after_finish_and_no_empty_chunks():
                 finished = True
     assert events[-1]["choices"][0]["finish_reason"] == "stop"
     assert events[-1]["choices"][0]["delta"].get("content", "").endswith("shipped.")
+
+
+# ---- helpers: a fake upstream that speaks SSE lines and records whether it was closed
+
+def _evt(index, content=None, finish=None):
+    delta = {} if content is None else {"content": content}
+    return "data: " + json.dumps({"id": "x", "object": "chat.completion.chunk", "created": 0, "model": "m",
+                                  "choices": [{"index": index, "delta": delta, "finish_reason": finish}]})
+
+
+class FakeUpstream:
+    def __init__(self, lines):
+        self._lines, self.closed, self.lines_served = lines, False, 0
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            self.lines_served += 1
+            yield line
+
+    async def aclose(self):
+        self.closed = True
+
+
+async def test_upstream_closed_when_client_disconnects_mid_stream():
+    endless = (_evt(0, "word ") for _ in range(1_000_000))
+    up = FakeUpstream(endless)
+    gen = gateway.redacted_stream(up)
+    for _ in range(3):
+        await gen.__anext__()
+    assert not up.closed
+    await gen.aclose()                      # what Starlette does when the client goes away
+    assert up.closed
+    assert up.lines_served < 10             # we stopped pulling from upstream immediately
+
+
+async def test_upstream_closed_on_normal_completion_and_on_error():
+    up = FakeUpstream([_evt(0, "hi"), _evt(0, None, "stop"), "data: [DONE]"])
+    _ = [c async for c in gateway.redacted_stream(up)]
+    assert up.closed
+
+    class Broken(FakeUpstream):
+        async def aiter_lines(self):
+            yield _evt(0, "hi")
+            raise httpx.ReadError("secret upstream detail 10.0.0.9")
+
+    up = Broken([])
+    out = b"".join([c async for c in gateway.redacted_stream(up)])
+    assert up.closed and b"Upstream stream interrupted" in out and b"10.0.0.9" not in out
+
+
+async def test_multiple_choices_are_redacted_independently():
+    texts = {0: "Mail bob.smith@example.com today, ok?",
+             1: "Card 4111 1111 1111 1111 and SSN 123-45-6789 end."}
+    chunks = {i: [t[k:k + 3] for k in range(0, len(t), 3)] for i, t in texts.items()}
+    lines = [_evt(0), _evt(1)]
+    for k in range(max(map(len, chunks.values()))):  # interleave the two choices chunk by chunk
+        for i in (0, 1):
+            if k < len(chunks[i]):
+                lines.append(_evt(i, chunks[i][k]))
+    lines += [_evt(0, None, "stop"), _evt(1, None, "stop"), "data: [DONE]"]
+
+    got, finished = {0: "", 1: ""}, set()
+    async for raw in gateway.redacted_stream(FakeUpstream(lines)):
+        line = raw.decode().strip()
+        if line == "data: [DONE]":
+            continue
+        for ch in json.loads(line[5:])["choices"]:
+            assert ch["index"] not in finished, "content after finish_reason"
+            got[ch["index"]] += ch["delta"].get("content", "")
+            if ch.get("finish_reason"):
+                finished.add(ch["index"])
+    assert finished == {0, 1}
+    assert got == {0: redact(texts[0]), 1: redact(texts[1])}
+    assert "bob" not in got[0] and "4111" not in got[1] and "123-45" not in got[1]
+
+
+async def test_invalid_json_body_is_400_and_non_object_events_are_skipped():
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://gw") as c:
+        assert (await c.post("/v1/chat/completions", content=b"{nope")).status_code == 400
+        assert (await c.post("/v1/chat/completions", json=[1, 2])).status_code == 400
+    out = b"".join([c async for c in gateway.redacted_stream(
+        FakeUpstream(["data: 5", 'data: "str"', _evt(0, "ok "), _evt(0, None, "stop"), "data: [DONE]"]))])
+    assert b'"ok "' in out
