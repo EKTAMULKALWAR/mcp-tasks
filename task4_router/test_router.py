@@ -383,3 +383,28 @@ def test_hash_key_script(tmp_path):
     ).stdout.strip()
     assert via_stdin == out
     assert subprocess.run([sys.executable, "hash_key.py"], input="", capture_output=True, text=True).returncode != 0
+
+
+# ---- claims made in the README
+
+async def test_failover_on_malformed_upstream_body(tmp_path):
+    _, c = make(tmp_path, lambda r: httpx.Response(200, text="<html>not json</html>"))
+    r = await c.post("/v1/chat/completions", json=BODY, headers=H)
+    assert r.status_code == 200 and r.headers["x-gateway-provider"] == "secondary"
+
+    _, c = make(tmp_path, lambda r: httpx.Response(200, json={"no": "choices"}))
+    r = await c.post("/v1/chat/completions", json=BODY, headers=H)
+    assert r.headers["x-gateway-provider"] == "secondary"
+
+
+async def test_streaming_requests_are_rejected_with_standard_error(tmp_path):
+    _, c = make(tmp_path, lambda r: httpx.Response(200, json=OK))
+    r = await c.post("/v1/chat/completions", json={**BODY, "stream": True}, headers=H)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "stream_unsupported"
+
+
+async def test_rate_limit_headers_and_request_id_on_success(tmp_path):
+    _, c = make(tmp_path, lambda r: httpx.Response(200, json=OK))
+    r = await c.post("/v1/chat/completions", json=BODY, headers={**H, "X-Request-Id": "trace-123"})
+    assert r.headers["x-ratelimit-limit"] == "50000" and int(r.headers["x-ratelimit-remaining"]) < 50000
+    assert r.headers["x-request-id"] == "trace-123"
