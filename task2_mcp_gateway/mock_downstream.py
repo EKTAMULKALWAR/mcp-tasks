@@ -1,4 +1,6 @@
 """Mock downstream MCP server (JSON-RPC over HTTP). Counts calls so tests can prove short-circuiting."""
+import os
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
@@ -37,4 +39,4 @@ async def mcp(req: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=9000)
+    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("PORT", 9000)))
