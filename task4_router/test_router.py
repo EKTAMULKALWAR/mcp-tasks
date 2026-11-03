@@ -387,6 +387,7 @@ def test_hash_key_script(tmp_path):
 
 # ---- claims made in the README
 
+
 async def test_failover_on_malformed_upstream_body(tmp_path):
     _, c = make(tmp_path, lambda r: httpx.Response(200, text="<html>not json</html>"))
     r = await c.post("/v1/chat/completions", json=BODY, headers=H)
