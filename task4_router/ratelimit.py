@@ -21,12 +21,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import sqlite3
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Callable
+
+log = logging.getLogger("llm-router.ratelimit")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS token_usage (
@@ -37,6 +40,7 @@ CREATE TABLE IF NOT EXISTS token_usage (
     settled     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_usage_tenant_ts ON token_usage (tenant, ts);
+CREATE INDEX IF NOT EXISTS ix_usage_ts ON token_usage (ts);
 """
 
 
@@ -117,6 +121,15 @@ class SlidingWindowTokenLimiter:
     def _release_sync(self, rid: str) -> None:
         self._txn(lambda c: c.execute("DELETE FROM token_usage WHERE id = ?", (rid,)))
 
+    def _sweep_sync(self, batch: int) -> int:
+        """Delete up to `batch` expired rows (any tenant) in one short transaction."""
+        def run(cur: sqlite3.Cursor) -> int:
+            cur.execute("DELETE FROM token_usage WHERE id IN "
+                        "(SELECT id FROM token_usage WHERE ts <= ? LIMIT ?)",
+                        (self.clock() - self.window, batch))
+            return cur.rowcount
+        return self._txn(run)
+
     def _usage_sync(self, tenant: str) -> int:
         cutoff = self.clock() - self.window
         with self._lock:
@@ -134,6 +147,28 @@ class SlidingWindowTokenLimiter:
 
     async def release(self, rid: str) -> None:
         await asyncio.to_thread(self._release_sync, rid)
+
+    async def sweep(self, batch: int = 500) -> int:
+        """Evict expired rows for *all* tenants, `batch` rows per transaction so the
+        write lock is released between batches and requests are never starved."""
+        total = 0
+        while True:
+            n = await asyncio.to_thread(self._sweep_sync, batch)
+            total += n
+            if n < batch:
+                return total
+
+    async def run_sweeper(self, interval_s: float) -> None:
+        """Background loop: idle tenants would otherwise keep their rows forever,
+        because per-request eviction only touches the requesting tenant."""
+        while True:
+            await asyncio.sleep(interval_s)
+            try:
+                removed = await self.sweep()
+                if removed:
+                    log.info("swept %d expired rate-limit rows", removed)
+            except sqlite3.Error:
+                log.exception("rate-limit sweep failed")  # retry on the next tick
 
     async def usage(self, tenant: str) -> int:
         return await asyncio.to_thread(self._usage_sync, tenant)

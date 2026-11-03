@@ -12,13 +12,13 @@ OK = {"choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}
       "usage": {"total_tokens": 15}}
 
 
-def make(tmp_path, primary, secondary=lambda r: httpx.Response(200, json=OK), tpm=50_000, timeout=0.3):
+def make(tmp_path, primary, secondary=lambda r: httpx.Response(200, json=OK), tpm=50_000, timeout=0.3, total=6.0):
     async def handler(request: httpx.Request):
         fn = primary if request.url.host == "primary" else secondary
         out = fn(request)
         return await out if asyncio.iscoroutine(out) else out
 
-    s = Settings(db_path=str(tmp_path / "rl.db"), tokens_per_minute=tpm, providers=[
+    s = Settings(db_path=str(tmp_path / "rl.db"), tokens_per_minute=tpm, total_timeout_s=total, providers=[
         Provider("primary", "http://primary/v1/chat/completions", "m1", timeout_s=timeout),
         Provider("secondary", "http://secondary/v1/chat/completions", "m2", timeout_s=timeout)])
     app = create_app(s, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
@@ -132,3 +132,103 @@ def test_state_persists_on_disk(tmp_path):
     a.close()
     b = SlidingWindowTokenLimiter(p, 100)
     assert not b._reserve_sync("t", 20).allowed
+
+
+# ---- regressions for bugs found in review
+
+async def test_non_object_messages_rejected_not_500(tmp_path):
+    _, c = make(tmp_path, lambda r: httpx.Response(200, json=OK))
+    r = await c.post("/v1/chat/completions", json={"messages": ["hi"]}, headers=H)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_body"
+
+
+async def test_request_larger_than_window_is_400_not_retryable_429(tmp_path):
+    app, c = make(tmp_path, lambda r: httpx.Response(200, json=OK), tpm=1000)
+    r = await c.post("/v1/chat/completions", json={**BODY, "max_tokens": 5000}, headers=H)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "request_too_large"
+    assert "retry-after" not in r.headers
+    assert await app.state.limiter.usage(tenant_hash("tenant-a-key")) == 0
+
+
+async def test_rate_limit_store_failure_is_sanitized_503(tmp_path):
+    import sqlite3
+    app, c = make(tmp_path, lambda r: httpx.Response(200, json=OK))
+
+    def locked(*a):
+        raise sqlite3.OperationalError("database is locked: /var/secret/rl.db")
+    app.state.limiter._reserve_sync = locked
+    r = await c.post("/v1/chat/completions", json=BODY, headers=H)
+    assert r.status_code == 503 and r.json()["error"]["code"] == "rate_limiter_unavailable"
+    assert "secret" not in r.text and r.headers["retry-after"] == "1"
+
+
+# ---- overall deadline
+
+async def test_total_deadline_bounds_latency(tmp_path):
+    async def slow(r):
+        await asyncio.sleep(5)
+        return httpx.Response(200, json=OK)
+
+    # per-attempt budget 0.3s each would allow 0.6s; the total cap of 0.4s must win
+    _, c = make(tmp_path, slow, slow, timeout=0.3, total=0.4)
+    t = time.perf_counter()
+    r = await c.post("/v1/chat/completions", json=BODY, headers=H)
+    elapsed = time.perf_counter() - t
+    assert r.status_code == 503 and r.json()["error"]["code"] == "all_providers_failed"
+    assert elapsed < 0.55, elapsed
+
+
+async def test_exhausted_deadline_skips_secondary(tmp_path):
+    seen = []
+
+    async def slow(r):
+        await asyncio.sleep(5)
+
+    _, c = make(tmp_path, slow, lambda r: seen.append(1) or httpx.Response(200, json=OK),
+                timeout=0.3, total=0.3)
+    r = await c.post("/v1/chat/completions", json=BODY, headers=H)
+    assert r.status_code == 503 and not seen
+
+
+# ---- background sweep of idle tenants
+
+def test_sweep_evicts_idle_tenants_in_batches(tmp_path):
+    now = [1000.0]
+    lim = SlidingWindowTokenLimiter(str(tmp_path / "s.db"), 1000, 60, clock=lambda: now[0])
+    for t in ("a", "b", "c"):
+        lim._reserve_sync(t, 10)
+        lim._reserve_sync(t, 10)
+    now[0] = 1050
+    lim._reserve_sync("fresh", 10)
+    now[0] = 1061  # the six old rows expired; "fresh" has not
+    assert lim._sweep_sync(batch=4) == 4          # bounded: only one batch per transaction
+    assert lim._sweep_sync(batch=4) == 2
+    left = lim._conn.execute("SELECT tenant FROM token_usage").fetchall()
+    assert left == [("fresh",)]
+
+
+async def test_async_sweep_loops_over_batches(tmp_path):
+    now = [0.0]
+    lim = SlidingWindowTokenLimiter(str(tmp_path / "s.db"), 1000, 60, clock=lambda: now[0])
+    for i in range(5):
+        lim._reserve_sync(f"t{i}", 1)
+    now[0] = 100
+    assert await lim.sweep(batch=2) == 5
+
+
+async def test_sweeper_task_runs_in_lifespan_and_is_cancelled(tmp_path):
+    now = [0.0]
+    app, _ = make(tmp_path, lambda r: httpx.Response(200, json=OK))
+    lim = app.state.limiter
+    lim.clock = lambda: now[0]
+    lim._reserve_sync("idle-tenant", 5)
+    app.state.router.s.sweep_interval_s = 0.01
+    async with app.router.lifespan_context(app):
+        now[0] = 100
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if lim._conn.execute("SELECT COUNT(*) FROM token_usage").fetchone()[0] == 0:
+                break
+        assert lim._conn.execute("SELECT COUNT(*) FROM token_usage").fetchone()[0] == 0
+        assert not app.state.sweeper.done()
+    assert app.state.sweeper.cancelled()

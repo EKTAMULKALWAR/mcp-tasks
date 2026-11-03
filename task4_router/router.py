@@ -15,10 +15,13 @@ Standard error payload:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import sqlite3
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -51,6 +54,8 @@ class Settings:
     db_path: str = os.environ.get("RATE_DB_PATH", "gateway_ratelimit.db")
     tokens_per_minute: int = int(os.environ.get("TENANT_TPM", 50_000))
     default_max_tokens: int = 1024
+    total_timeout_s: float = float(os.environ.get("GATEWAY_TOTAL_TIMEOUT", 6.0))  # all attempts combined
+    sweep_interval_s: float = float(os.environ.get("RATE_SWEEP_INTERVAL", 30.0))
     providers: list[Provider] = field(default_factory=lambda: [
         Provider("primary", os.environ.get("PRIMARY_URL", "http://127.0.0.1:9201/v1/chat/completions"),
                  os.environ.get("PRIMARY_MODEL", "gpt-primary"), os.environ.get("PRIMARY_KEY", "")),
@@ -91,6 +96,8 @@ def estimate_prompt_tokens(body: dict) -> int:
 def validate_body(body: object) -> dict:
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list) or not body["messages"]:
         raise GatewayError(400, "invalid_request_error", "invalid_body", "Body must include a non-empty 'messages' list")
+    if not all(isinstance(m, dict) for m in body["messages"]):
+        raise GatewayError(400, "invalid_request_error", "invalid_body", "Each message must be an object")
     mt = body.get("max_tokens")
     if mt is not None and (not isinstance(mt, int) or isinstance(mt, bool) or mt <= 0):
         raise GatewayError(400, "invalid_request_error", "invalid_max_tokens", "'max_tokens' must be a positive integer")
@@ -103,7 +110,7 @@ class ModelRouter:
     def __init__(self, settings: Settings, client: httpx.AsyncClient, limiter: SlidingWindowTokenLimiter):
         self.s, self.client, self.limiter = settings, client, limiter
 
-    async def _attempt(self, p: Provider, body: dict, request_id: str) -> dict:
+    async def _attempt(self, p: Provider, body: dict, request_id: str, timeout_s: float) -> dict:
         payload = {**body, "model": p.model}
         headers = {"X-Request-Id": request_id}
         if p.api_key:
@@ -112,10 +119,10 @@ class ModelRouter:
             # asyncio.timeout bounds the *whole* attempt (connect + send + read). On expiry
             # the in-flight httpx call is cancelled and its connection is discarded, so a
             # slow primary can't complete later and race the fallback's response.
-            async with asyncio.timeout(p.timeout_s):
+            async with asyncio.timeout(timeout_s):
                 resp = await self.client.post(p.url, json=payload, headers=headers)
         except TimeoutError:
-            log.warning("[%s] %s timed out after %.1fs", request_id, p.name, p.timeout_s)
+            log.warning("[%s] %s timed out after %.1fs", request_id, p.name, timeout_s)
             raise RetryableUpstream("timeout")
         except httpx.HTTPError as exc:
             log.warning("[%s] %s transport error: %r", request_id, p.name, exc)
@@ -139,7 +146,16 @@ class ModelRouter:
     async def complete(self, api_key: str, body: dict, request_id: str) -> tuple[dict, dict]:
         tenant = tenant_hash(api_key)
         cost = estimate_prompt_tokens(body) + body.get("max_tokens", self.s.default_max_tokens)
-        decision = await self.limiter.reserve(tenant, cost)
+        if cost > self.limiter.limit:  # can never fit in any window: a retry would not help
+            raise GatewayError(400, "invalid_request_error", "request_too_large",
+                               f"Estimated request size exceeds the {self.limiter.limit}-token window; "
+                               "reduce the prompt or max_tokens")
+        try:
+            decision = await self.limiter.reserve(tenant, cost)
+        except sqlite3.Error:
+            log.exception("[%s] rate-limit store unavailable", request_id)
+            raise GatewayError(503, "upstream_unavailable", "rate_limiter_unavailable",
+                               "Service temporarily unavailable. Please retry shortly.", {"Retry-After": "1"})
         rl_headers = {"X-RateLimit-Limit": str(decision.limit),
                       "X-RateLimit-Remaining": str(decision.remaining)}
         if not decision.allowed:
@@ -149,10 +165,16 @@ class ModelRouter:
                                {**rl_headers, "Retry-After": str(retry)})
 
         rid, settled = decision.reservation_id, False
+        deadline = time.monotonic() + self.s.total_timeout_s
         try:
             for i, p in enumerate(self.s.providers):
+                # each attempt gets its own budget, but never more than what is left overall
+                budget = min(p.timeout_s, deadline - time.monotonic())
+                if budget <= 0:
+                    log.warning("[%s] total deadline exhausted before trying %s", request_id, p.name)
+                    break
                 try:
-                    data = await self._attempt(p, body, request_id)
+                    data = await self._attempt(p, body, request_id, budget)
                 except RetryableUpstream as why:
                     if i + 1 < len(self.s.providers):
                         log.info("[%s] failing over %s -> %s (%s)", request_id, p.name,
@@ -177,7 +199,11 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
     settings = settings or Settings()
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        app.state.sweeper = asyncio.create_task(app.state.limiter.run_sweeper(settings.sweep_interval_s))
         yield
+        app.state.sweeper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await app.state.sweeper
         await app.state.client.aclose()
         app.state.limiter.close()
 
