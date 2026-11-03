@@ -1,7 +1,8 @@
 """Task 4 — Resilient model router for an LLM Gateway.
 
 Flow per request:
-  1. authenticate tenant (Bearer key, hashed)            -> 401 gateway error
+  1. authenticate: Bearer key -> tenant via the key registry   -> 401 gateway error
+     (rejected before any rate-limit check or database write)
   2. estimate cost, atomically reserve in SQLite window  -> 429 gateway error + Retry-After
   3. try providers in order; each attempt is bounded by asyncio.timeout(3.0s).
      Fail over on: 429, timeout, connection error, 5xx.  Do NOT fail over on other 4xx
@@ -34,6 +35,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ratelimit import SlidingWindowTokenLimiter, tenant_hash
+from tenants import TenantRegistry
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("llm-router")
@@ -56,6 +58,8 @@ class Settings:
     db_path: str = os.environ.get("RATE_DB_PATH", "gateway_ratelimit.db")
     tokens_per_minute: int = int(os.environ.get("TENANT_TPM", 50_000))
     default_max_tokens: int = 1024
+    # JSON file: tenant -> sha256(api key). Unset = development mode (any key is its own tenant).
+    tenant_keys_file: str | None = os.environ.get("TENANT_KEYS_FILE") or None
     total_timeout_s: float = float(os.environ.get("GATEWAY_TOTAL_TIMEOUT", 6.0))  # all attempts combined
     sweep_interval_s: float = float(os.environ.get("RATE_SWEEP_INTERVAL", 30.0))
     providers: list[Provider] = field(
@@ -165,8 +169,7 @@ class ModelRouter:
             raise RetryableUpstream("malformed")
         return data
 
-    async def complete(self, api_key: str, body: dict, request_id: str) -> tuple[dict, dict]:
-        tenant = tenant_hash(api_key)
+    async def complete(self, tenant: str, body: dict, request_id: str) -> tuple[dict, dict]:
         cost = estimate_prompt_tokens(body) + body.get("max_tokens", self.s.default_max_tokens)
         if cost > self.limiter.limit:  # can never fit in any window: a retry would not help
             raise GatewayError(
@@ -238,6 +241,21 @@ class ModelRouter:
 
 def create_app(settings: Settings | None = None, client: httpx.AsyncClient | None = None) -> FastAPI:
     settings = settings or Settings()
+    registry = TenantRegistry.from_file(settings.tenant_keys_file) if settings.tenant_keys_file else None
+    if registry is None:
+        log.warning(
+            "TENANT_KEYS_FILE is not set: running WITHOUT a key registry. Any bearer string is accepted "
+            "and becomes its own tenant, so callers can rotate keys to dodge rate limits. Development only."
+        )
+
+    def authenticate(key: str) -> str:
+        """Bearer key -> tenant name, or 401. Runs before any rate-limit check or database write."""
+        if registry is None:
+            return tenant_hash(key)  # dev mode: the (hashed) key is the tenant
+        tenant = registry.resolve(key)
+        if tenant is None:
+            raise GatewayError(401, "authentication_error", "invalid_api_key", "Invalid API key")
+        return tenant
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -298,6 +316,7 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
             raise GatewayError(
                 401, "authentication_error", "missing_api_key", "Provide 'Authorization: Bearer <api key>'"
             )
+        tenant = authenticate(key.strip())
         try:
             body = validate_body(json.loads(await request.body()))
         except json.JSONDecodeError:
@@ -306,7 +325,7 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
             raise GatewayError(
                 400, "invalid_request_error", "stream_unsupported", "Streaming not supported on this route"
             )
-        data, headers = await app.state.router.complete(key.strip(), body, rid)
+        data, headers = await app.state.router.complete(tenant, body, rid)
         return JSONResponse(data, headers={**headers, "X-Request-Id": rid})
 
     return app

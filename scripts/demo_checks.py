@@ -179,6 +179,12 @@ def router_call(port, key="demo-key", max_tokens=100):
 
 def task4() -> None:
     print("\n== Task 4: rate limiter + fallback router")
+    r, _ = router_call(E["DEMO_R_429"], key="made-up-key")
+    check(
+        "unknown API key -> 401 invalid_api_key",
+        r.status_code == 401 and r.json()["error"]["code"] == "invalid_api_key",
+    )
+
     r, _ = router_call(E["DEMO_R_429"])
     check(
         "primary 429 -> failover to secondary", r.status_code == 200 and r.headers["x-gateway-provider"] == "secondary"

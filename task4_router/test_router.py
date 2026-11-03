@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 
 import httpx
@@ -6,17 +7,25 @@ import pytest
 
 from ratelimit import SlidingWindowTokenLimiter, tenant_hash
 from router import Provider, Settings, create_app
+from tenants import TenantRegistry, key_digest
 
 OK = {"choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}], "usage": {"total_tokens": 15}}
 
 
-def make(tmp_path, primary, secondary=lambda r: httpx.Response(200, json=OK), tpm=50_000, timeout=0.3, total=6.0):
+def make(
+    tmp_path, primary, secondary=lambda r: httpx.Response(200, json=OK), tpm=50_000, timeout=0.3, total=6.0, keys=None
+):
     async def handler(request: httpx.Request):
         fn = primary if request.url.host == "primary" else secondary
         out = fn(request)
         return await out if asyncio.iscoroutine(out) else out
 
+    keys_file = None
+    if keys is not None:  # tenant -> sha256 hex (or list of them), exactly as an operator would write it
+        keys_file = str(tmp_path / "keys.json")
+        (tmp_path / "keys.json").write_text(json.dumps(keys))
     s = Settings(
+        tenant_keys_file=keys_file,
         db_path=str(tmp_path / "rl.db"),
         tokens_per_minute=tpm,
         total_timeout_s=total,
@@ -248,3 +257,129 @@ async def test_sweeper_task_runs_in_lifespan_and_is_cancelled(tmp_path):
         assert lim._conn.execute("SELECT COUNT(*) FROM token_usage").fetchone()[0] == 0
         assert not app.state.sweeper.done()
     assert app.state.sweeper.cancelled()
+
+
+# ---- tenant key registry
+
+
+def _rows(app):
+    return app.state.limiter._conn.execute("SELECT COUNT(*) FROM token_usage").fetchone()[0]
+
+
+def auth(key):
+    return {"Authorization": f"Bearer {key}"}
+
+
+async def test_registry_known_key_works_and_budget_is_keyed_by_tenant_name(tmp_path):
+    app, c = make(tmp_path, lambda r: httpx.Response(200, json=OK), keys={"acme": key_digest("acme-secret")})
+    r = await c.post("/v1/chat/completions", json=BODY, headers=auth("acme-secret"))
+    assert r.status_code == 200 and r.headers["x-gateway-provider"] == "primary"
+    assert await app.state.limiter.usage("acme") == 15  # keyed on tenant name ...
+    assert await app.state.limiter.usage(tenant_hash("acme-secret")) == 0  # ... not on the raw key
+
+
+async def test_registry_unknown_key_is_401_before_any_database_write(tmp_path):
+    called = []
+    app, c = make(
+        tmp_path,
+        lambda r: called.append(1) or httpx.Response(200, json=OK),
+        keys={"acme": key_digest("acme-secret")},
+    )
+    for key in ("made-up-key-1", "made-up-key-2", "acme-secre", "ACME-SECRET"):
+        r = await c.post("/v1/chat/completions", json=BODY, headers=auth(key))
+        assert r.status_code == 401 and r.json()["error"]["code"] == "invalid_api_key"
+        assert set(r.json()["error"]) == {"type", "code", "message", "request_id"}
+    assert _rows(app) == 0 and not called  # nothing reserved, no provider called
+
+
+async def test_registry_unknown_key_rejected_even_with_bad_body(tmp_path):
+    # authentication comes first: an unauthenticated caller learns nothing about body validation
+    _, c = make(tmp_path, lambda r: httpx.Response(200, json=OK), keys={"acme": key_digest("k")})
+    r = await c.post("/v1/chat/completions", content=b"{", headers=auth("nope"))
+    assert r.status_code == 401 and r.json()["error"]["code"] == "invalid_api_key"
+
+
+async def test_missing_key_still_missing_api_key_in_registry_mode(tmp_path):
+    _, c = make(tmp_path, lambda r: httpx.Response(200, json=OK), keys={"acme": key_digest("k")})
+    r = await c.post("/v1/chat/completions", json=BODY)
+    assert r.status_code == 401 and r.json()["error"]["code"] == "missing_api_key"
+
+
+async def test_two_keys_of_one_tenant_share_one_budget(tmp_path):
+    keys = {"acme": [key_digest("acme-key-old"), key_digest("acme-key-new")], "globex": key_digest("globex-key")}
+    app, c = make(
+        tmp_path,
+        lambda r: httpx.Response(200, json={**OK, "usage": {"total_tokens": 900}}),
+        tpm=1000,
+        keys=keys,
+    )
+    assert (await c.post("/v1/chat/completions", json=BODY, headers=auth("acme-key-old"))).status_code == 200
+    # the second key of the same tenant hits the same, now exhausted, budget
+    r = await c.post("/v1/chat/completions", json=BODY, headers=auth("acme-key-new"))
+    assert r.status_code == 429 and r.json()["error"]["code"] == "tenant_token_limit"
+    # a different tenant is unaffected
+    assert (await c.post("/v1/chat/completions", json=BODY, headers=auth("globex-key"))).status_code == 200
+    assert await app.state.limiter.usage("acme") == 900
+
+
+def test_registry_compares_keys_of_any_length():
+    reg = TenantRegistry(
+        {"short": [key_digest("a")], "long": [key_digest("x" * 10_000)], "empty-ish": [key_digest(" ")]}
+    )
+    assert reg.resolve("a") == "short"
+    assert reg.resolve("x" * 10_000) == "long"
+    assert reg.resolve(" ") == "empty-ish"
+    for wrong in ("", "aa", "x" * 9_999, "x" * 10_001, "b"):
+        assert reg.resolve(wrong) is None
+
+
+def test_registry_file_is_validated_and_rejects_plaintext_keys(tmp_path):
+    def load(content):
+        f = tmp_path / "k.json"
+        f.write_text(content if isinstance(content, str) else json.dumps(content))
+        return TenantRegistry.from_file(str(f))
+
+    assert load({"acme": key_digest("k").upper()}).resolve("k") == "acme"  # hex case does not matter
+    for bad in ({"acme": "my-plaintext-key"}, {"acme": []}, {}, [], "{not json", {"acme": 5}, {"": key_digest("k")}):
+        with pytest.raises(ValueError) as exc:
+            load(bad)
+        assert "my-plaintext-key" not in str(exc.value)
+    with pytest.raises(ValueError):
+        TenantRegistry.from_file(str(tmp_path / "missing.json"))
+
+
+def test_app_refuses_to_start_with_invalid_key_file(tmp_path):
+    (tmp_path / "bad.json").write_text('{"acme": "plaintext"}')
+    with pytest.raises(ValueError):
+        create_app(Settings(tenant_keys_file=str(tmp_path / "bad.json"), db_path=str(tmp_path / "x.db")))
+
+
+async def test_dev_mode_without_registry_still_works_and_warns_once(tmp_path, caplog):
+    with caplog.at_level("WARNING", logger="llm-router"):
+        app, c = make(tmp_path, lambda r: httpx.Response(200, json=OK))  # keys=None -> TENANT_KEYS_FILE unset
+    warnings = [r for r in caplog.records if "WITHOUT a key registry" in r.getMessage()]
+    assert len(warnings) == 1 and warnings[0].levelname == "WARNING"
+    r = await c.post("/v1/chat/completions", json=BODY, headers=auth("any-made-up-key"))
+    assert r.status_code == 200
+    assert await app.state.limiter.usage(tenant_hash("any-made-up-key")) == 15  # key is its own tenant
+
+
+async def test_registry_mode_does_not_warn(tmp_path, caplog):
+    with caplog.at_level("WARNING", logger="llm-router"):
+        make(tmp_path, lambda r: httpx.Response(200, json=OK), keys={"acme": key_digest("k")})
+    assert not [r for r in caplog.records if "WITHOUT a key registry" in r.getMessage()]
+
+
+def test_hash_key_script(tmp_path):
+    import subprocess
+    import sys
+
+    out = subprocess.run(
+        [sys.executable, "hash_key.py", "acme-secret"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert out == key_digest("acme-secret") and len(out) == 64
+    via_stdin = subprocess.run(
+        [sys.executable, "hash_key.py"], input="acme-secret\n", capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert via_stdin == out
+    assert subprocess.run([sys.executable, "hash_key.py"], input="", capture_output=True, text=True).returncode != 0

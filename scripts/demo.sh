@@ -49,8 +49,12 @@ start m_ok task4_router PORT=$P_OK -- mock_providers.py secondary $P_OK ok
 start m_429 task4_router -- mock_providers.py primary $P_429 429
 start m_slow task4_router -- mock_providers.py primary $P_SLOW slow
 start m_500 task4_router -- mock_providers.py primary $P_500 500
+# Tenant key registry: only the SHA-256 of the demo key is written to disk (never the key itself).
+DEMO_KEY="demo-key"
+printf '{"demo": "%s"}\n' "$("$PY" "$ROOT/task4_router/hash_key.py" "$DEMO_KEY")" >"$TMP/tenant_keys.json"
+
 router() {  # name port primary_port secondary_port [extra env]
-  start "$1" task4_router PORT=$2 RATE_DB_PATH="$TMP/$1.db" \
+  start "$1" task4_router PORT=$2 RATE_DB_PATH="$TMP/$1.db" TENANT_KEYS_FILE="$TMP/tenant_keys.json" \
         PRIMARY_URL=http://127.0.0.1:$3/v1/chat/completions \
         SECONDARY_URL=http://127.0.0.1:$4/v1/chat/completions "${@:5}" -- router.py
 }

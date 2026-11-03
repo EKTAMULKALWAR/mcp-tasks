@@ -12,4 +12,4 @@ ignore = [
 
 [lint.isort]
 # each task folder is its own import root (modules import siblings like `import gateway`)
-known-first-party = ["gateway", "redactor", "mock_provider", "mock_downstream", "router", "ratelimit", "server"]
+known-first-party = ["gateway", "redactor", "mock_provider", "mock_downstream", "router", "ratelimit", "tenants", "hash_key", "server"]

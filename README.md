@@ -162,9 +162,10 @@ provider on 429 or a 3000 ms timeout, sanitized gateway errors, on-disk SQLite.
 
 ```mermaid
 flowchart TD
-    R[Request + Bearer key] --> V[validate body]
-    V --> T["tenant = sha256(key)"]
-    T --> RES{"reserve prompt+max_tokens<br/>BEGIN IMMEDIATE · evict · sum · insert"}
+    R[Request + Bearer key] --> AU{"key registry<br/>sha256 + compare_digest"}
+    AU -- unknown --> U401["401 invalid_api_key"]
+    AU -- "tenant name" --> V[validate body]
+    V --> RES{"reserve prompt+max_tokens<br/>BEGIN IMMEDIATE · evict · sum · insert"}
     RES -- over budget --> L["429 + Retry-After"]
     RES -- reserved --> A1[primary · timeout ≤ 3 s]
     A1 -- "ok" --> S[settle to real usage]
@@ -189,7 +190,19 @@ client disconnect cannot leak a reservation.
 Expired rows are deleted in the same transaction as the check, so sums are exact. Tenants who stop calling are
 handled by a **background sweeper** (started and cancelled by the app's lifespan) that deletes expired rows for all
 tenants in small batches, so the write lock is released between batches. `Retry-After` is exact: it walks the
-oldest rows until enough tokens would have expired. Keys are stored as SHA-256 hashes only.
+oldest rows until enough tokens would have expired.
+
+**Tenant authentication (key registry).** Set `TENANT_KEYS_FILE` to a JSON file mapping tenant name to the SHA-256
+hex of its API key (or a list of hashes, to run several keys per tenant, e.g. during rotation):
+`{"acme": "<sha256 hex>", "globex": ["<hex>", "<hex>"]}`. Build entries with `python hash_key.py <key>`; plaintext
+keys are never stored, and the loader rejects anything that is not a 64-char hex digest (the app refuses to start).
+The presented key is hashed and compared with `hmac.compare_digest` against every stored digest with no early exit,
+so keys of any length work and timing does not reveal which entry matched. An unknown key gets `401 invalid_api_key`
+(a missing header is `401 missing_api_key`) **before** the body is parsed, any rate-limit check, or any database
+write. The limiter is keyed on the **tenant name**, so all keys of a tenant share one budget and rotating made-up
+keys gains nothing. **Development mode:** if `TENANT_KEYS_FILE` is unset, any bearer string is accepted and is its
+own tenant (the limiter stores only its SHA-256), and one `WARNING` is logged at startup saying the gateway runs
+without a key registry. Do not run that way in production.
 
 **Graceful fallback mechanics and standardized error sanitization.** Failover on 429, timeout, transport error,
 5xx, or a malformed body; **not** on other 4xx (a bad request would just be billed twice). Every error has the same
@@ -201,7 +214,9 @@ upstream failures and assert none reach the client.
 Edge cases handled (tests): failover on 429 and on timeout (bounded wall-clock), both providers failing (503,
 reservation released), 4xx not failed over, request larger than the whole window (400 `request_too_large`, not a
 retryable 429), non-object `messages` (400, not 500), SQLite error from the limiter (sanitized 503 + `Retry-After`),
-tenant isolation, window eviction with an injected clock, state surviving a restart, sweeper batching.
+tenant isolation, window eviction with an injected clock, state surviving a restart, sweeper batching; registry:
+unknown key (401, zero database rows, no provider call), two keys of one tenant sharing a budget, keys of different
+lengths, invalid/plaintext key files, dev mode warning once.
 
 ---
 
@@ -216,8 +231,9 @@ tenant isolation, window eviction with an injected clock, state surviving a rest
 
 ## Trade-offs and what I'd do in production
 
-- **Tenant identity (Task 4).** Any bearer string is currently accepted as a tenant, so a caller could rotate keys
-  to get fresh budgets. Production needs a key registry (hashed keys + per-tenant limits) behind the same hashing.
+- **Tenant identity (Task 4).** Keys are authenticated against a hashed registry file (see above). In production
+  I would back it with a secrets manager or database, add per-tenant limits and key expiry/revocation, and hash with a
+  slow KDF only if keys were low-entropy (API keys are random, so a plain SHA-256 is fine).
 - **Rate limiting at scale.** SQLite with `BEGIN IMMEDIATE` is correct across processes on one host, but writers
   serialize. For multi-node deployments use Redis (sorted sets or a Lua token bucket) or a dedicated limiter service.
 - **Circuit breaker.** Today every request tries the primary first. A per-provider breaker (open after N failures,
