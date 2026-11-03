@@ -60,7 +60,11 @@ router r_down  $P_R_DOWN  $P_500  $P_500
 export DEMO_SECRET=$SECRET DEMO_ROOT=$ROOT DEMO_PY=$PY
 export DEMO_GW2=$P_GW2 DEMO_DS=$P_DS DEMO_GW3=$P_GW3
 export DEMO_R_429=$P_R_429 DEMO_R_LIMIT=$P_R_LIMIT DEMO_R_SLOW=$P_R_SLOW DEMO_R_DOWN=$P_R_DOWN
-"$PY" "$ROOT/scripts/demo_checks.py"
+# Run the checker in the background and `wait`, so bash runs the trap immediately on a signal
+# (it would otherwise defer the trap until the foreground command finished).
+"$PY" "$ROOT/scripts/demo_checks.py" &
+PIDS+=($!)
+wait $!
 status=$?
 if [ $status -ne 0 ]; then
   echo; echo "--- server logs (tail) ---"
