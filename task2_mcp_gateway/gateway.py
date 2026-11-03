@@ -17,6 +17,7 @@ Wire-format handling: -32700 parse error, -32600 invalid request, -32602 for a
 tools/call with no string params.name. Batches are split: denied entries are answered
 by the gateway, allowed ones are forwarded as a (smaller) batch, results re-merged.
 """
+
 from __future__ import annotations
 
 import json
@@ -29,8 +30,8 @@ from typing import Any
 import httpx
 import jwt
 from fastapi import FastAPI, Request
-from starlette.background import BackgroundTask
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mcp-gateway")
@@ -45,8 +46,19 @@ PARSE_ERROR, INVALID_REQUEST, INVALID_PARAMS = -32700, -32600, -32602
 UNAUTHORIZED_TOOL, UNAUTHENTICATED, UPSTREAM_ERROR = -32001, -32000, -32003
 
 # Headers that must not be copied hop-to-hop, plus the client's credential (never leaked downstream).
-HOP_BY_HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
-              "proxy-authorization", "proxy-authenticate", "host", "content-length", "authorization"}
+HOP_BY_HOP = {
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "te",
+    "trailer",
+    "upgrade",
+    "proxy-authorization",
+    "proxy-authenticate",
+    "host",
+    "content-length",
+    "authorization",
+}
 
 
 def rpc_error(id_: Any, code: int, message: str, data: Any = None) -> dict:
@@ -57,6 +69,7 @@ def rpc_error(id_: Any, code: int, message: str, data: Any = None) -> dict:
 
 
 # ------------------------------------------------------------------ auth
+
 
 class AuthError(Exception):
     pass
@@ -79,6 +92,7 @@ def role_from_header(header: str | None) -> str:
 
 
 # ------------------------------------------------------------------ policy
+
 
 def is_valid_request_obj(msg: Any) -> bool:
     if not (isinstance(msg, dict) and msg.get("jsonrpc") == "2.0" and isinstance(msg.get("method"), str)):
@@ -127,8 +141,10 @@ def forward_headers(req: Request) -> dict[str, str]:
 
 
 async def forward(req: Request, payload: Any) -> httpx.Response:
-    upstream = client.build_request("POST", DOWNSTREAM_URL, headers=forward_headers(req),
-                                    content=json.dumps(payload).encode())
+    assert client is not None, "gateway used before startup"
+    upstream = client.build_request(
+        "POST", DOWNSTREAM_URL, headers=forward_headers(req), content=json.dumps(payload).encode()
+    )
     return await client.send(upstream, stream=True)
 
 
@@ -159,14 +175,18 @@ async def mcp_endpoint(req: Request) -> Response:
         role = role_from_header(req.headers.get("authorization"))
     except AuthError as exc:
         log.info("auth rejected: %s", exc)
-        return JSONResponse(rpc_error(None, UNAUTHENTICATED, "Unauthenticated"), status_code=401,
-                            headers={"WWW-Authenticate": 'Bearer error="invalid_token"'})
+        return JSONResponse(
+            rpc_error(None, UNAUTHENTICATED, "Unauthenticated"),
+            status_code=401,
+            headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+        )
 
     # 2. parse wire format
     raw = await read_body_capped(req, MAX_BODY_BYTES)
     if raw is None:
-        return JSONResponse(rpc_error(None, INVALID_REQUEST, "Request body too large",
-                                      {"max_bytes": MAX_BODY_BYTES}), status_code=413)
+        return JSONResponse(
+            rpc_error(None, INVALID_REQUEST, "Request body too large", {"max_bytes": MAX_BODY_BYTES}), status_code=413
+        )
     try:
         payload = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -203,22 +223,28 @@ async def mcp_endpoint(req: Request) -> Response:
 
     if not is_batch or not local:
         # Transparent: stream bytes (JSON or SSE) back untouched.
-        return StreamingResponse(upstream.aiter_raw(), status_code=upstream.status_code,
-                                 headers=response_headers(upstream),
-                                 background=BackgroundTask(upstream.aclose))
+        return StreamingResponse(
+            upstream.aiter_raw(),
+            status_code=upstream.status_code,
+            headers=response_headers(upstream),
+            background=BackgroundTask(upstream.aclose),
+        )
 
     # 4b. mixed batch: merge gateway-generated errors with downstream results
-    body = await upstream.aread()
+    downstream_body = await upstream.aread()
     await upstream.aclose()
     try:
-        downstream_results = json.loads(body) if body else []
+        downstream_results = json.loads(downstream_body) if downstream_body else []
     except json.JSONDecodeError:
-        downstream_results = [rpc_error(m.get("id"), UPSTREAM_ERROR, "Bad downstream response")
-                              for m in to_forward if "id" in m]
+        downstream_results = [
+            rpc_error(m.get("id"), UPSTREAM_ERROR, "Bad downstream response") for m in to_forward if "id" in m
+        ]
     if isinstance(downstream_results, dict):
         downstream_results = [downstream_results]
-    return JSONResponse(local + downstream_results, headers={
-        k: v for k, v in response_headers(upstream).items() if k.lower().startswith("mcp-")})
+    return JSONResponse(
+        local + downstream_results,
+        headers={k: v for k, v in response_headers(upstream).items() if k.lower().startswith("mcp-")},
+    )
 
 
 @app.get("/healthz")
@@ -228,4 +254,5 @@ async def healthz() -> dict:
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("PORT", 8080)))

@@ -17,6 +17,7 @@ Then buffer[:h] is redacted and emitted, buffer[h:] becomes the new tail.
 
 Work per chunk is O(len(chunk) + MAX_HOLD); memory is O(MAX_HOLD + chunk).
 """
+
 from __future__ import annotations
 
 import re

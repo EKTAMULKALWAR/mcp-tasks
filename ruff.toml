@@ -1,0 +1,15 @@
+line-length = 120
+target-version = "py311"
+extend-exclude = [".venv"]
+
+[lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = [
+    # We deliberately translate internal exceptions into sanitized protocol/gateway errors; the
+    # original cause is logged where it happens and never serialized to clients.
+    "B904",
+]
+
+[lint.isort]
+# each task folder is its own import root (modules import siblings like `import gateway`)
+known-first-party = ["gateway", "redactor", "mock_provider", "mock_downstream", "router", "ratelimit", "server"]

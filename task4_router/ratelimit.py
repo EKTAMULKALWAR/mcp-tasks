@@ -17,6 +17,7 @@ so the event loop is never stalled.
 
 Tenant keys are stored as SHA-256 hashes, never in plaintext.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -26,8 +27,8 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 log = logging.getLogger("llm-router.ratelimit")
 
@@ -58,8 +59,9 @@ def tenant_hash(api_key: str) -> str:
 
 
 class SlidingWindowTokenLimiter:
-    def __init__(self, db_path: str, limit_tokens: int = 50_000, window_s: float = 60.0,
-                 clock: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self, db_path: str, limit_tokens: int = 50_000, window_s: float = 60.0, clock: Callable[[], float] = time.time
+    ) -> None:
         self.db_path, self.limit, self.window, self.clock = db_path, limit_tokens, window_s, clock
         self._conn = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False, timeout=5.0)
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -93,18 +95,19 @@ class SlidingWindowTokenLimiter:
             now = self.clock()
             cutoff = now - self.window
             cur.execute("DELETE FROM token_usage WHERE tenant = ? AND ts <= ?", (tenant, cutoff))  # eviction
-            used = cur.execute("SELECT COALESCE(SUM(tokens), 0) FROM token_usage WHERE tenant = ?",
-                               (tenant,)).fetchone()[0]
+            used = cur.execute(
+                "SELECT COALESCE(SUM(tokens), 0) FROM token_usage WHERE tenant = ?", (tenant,)
+            ).fetchone()[0]
             if used + cost <= self.limit:
                 rid = uuid.uuid4().hex
-                cur.execute("INSERT INTO token_usage (id, tenant, ts, tokens) VALUES (?, ?, ?, ?)",
-                            (rid, tenant, now, cost))
+                cur.execute(
+                    "INSERT INTO token_usage (id, tenant, ts, tokens) VALUES (?, ?, ?, ?)", (rid, tenant, now, cost)
+                )
                 return Decision(True, rid, self.limit, self.limit - used - cost, 0.0)
             # exact retry-after: walk oldest rows until enough tokens would have expired
             need, freed = used + cost - self.limit, 0
             retry = self.window
-            for ts, tokens in cur.execute(
-                    "SELECT ts, tokens FROM token_usage WHERE tenant = ? ORDER BY ts", (tenant,)):
+            for ts, tokens in cur.execute("SELECT ts, tokens FROM token_usage WHERE tenant = ? ORDER BY ts", (tenant,)):
                 freed += tokens
                 if freed >= need:
                     retry = max(0.0, ts + self.window - now)
@@ -115,27 +118,33 @@ class SlidingWindowTokenLimiter:
 
     def _settle_sync(self, rid: str, actual_tokens: int) -> None:
         # Keeps the original timestamp: the request is still charged at the moment it started.
-        self._txn(lambda c: c.execute("UPDATE token_usage SET tokens = ?, settled = 1 WHERE id = ?",
-                                      (max(0, int(actual_tokens)), rid)))
+        self._txn(
+            lambda c: c.execute(
+                "UPDATE token_usage SET tokens = ?, settled = 1 WHERE id = ?", (max(0, int(actual_tokens)), rid)
+            )
+        )
 
     def _release_sync(self, rid: str) -> None:
         self._txn(lambda c: c.execute("DELETE FROM token_usage WHERE id = ?", (rid,)))
 
     def _sweep_sync(self, batch: int) -> int:
         """Delete up to `batch` expired rows (any tenant) in one short transaction."""
+
         def run(cur: sqlite3.Cursor) -> int:
-            cur.execute("DELETE FROM token_usage WHERE id IN "
-                        "(SELECT id FROM token_usage WHERE ts <= ? LIMIT ?)",
-                        (self.clock() - self.window, batch))
+            cur.execute(
+                "DELETE FROM token_usage WHERE id IN (SELECT id FROM token_usage WHERE ts <= ? LIMIT ?)",
+                (self.clock() - self.window, batch),
+            )
             return cur.rowcount
+
         return self._txn(run)
 
     def _usage_sync(self, tenant: str) -> int:
         cutoff = self.clock() - self.window
         with self._lock:
             return self._conn.execute(
-                "SELECT COALESCE(SUM(tokens),0) FROM token_usage WHERE tenant=? AND ts > ?",
-                (tenant, cutoff)).fetchone()[0]
+                "SELECT COALESCE(SUM(tokens),0) FROM token_usage WHERE tenant=? AND ts > ?", (tenant, cutoff)
+            ).fetchone()[0]
 
     # ---------------------------------------------------------- async API
 

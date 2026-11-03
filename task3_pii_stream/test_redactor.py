@@ -23,7 +23,7 @@ def stream_through(text, seed):
     r, out, i = StreamRedactor(), [], 0
     while i < len(text):
         n = rnd.randint(1, 8)
-        out.append(r.feed(text[i:i + n]))
+        out.append(r.feed(text[i : i + n]))
         i += n
     out.append(r.flush())
     return "".join(out)
@@ -46,7 +46,7 @@ def test_patterns():
 def test_low_latency_prose_released_immediately():
     r = StreamRedactor()
     assert r.feed("Hello there, ") == "Hello there, "
-    assert r.feed("wor") == ""          # partial word held
+    assert r.feed("wor") == ""  # partial word held
     assert r.feed("ld! ") == "world! "  # released at the boundary
 
 
@@ -84,8 +84,7 @@ async def test_no_content_after_finish_and_no_empty_chunks():
     gateway.PROVIDER_URL = "http://provider/v1/chat/completions"
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://gw") as c:
         r = await c.post("/v1/chat/completions", json={"stream": True, "messages": []})
-    events = [json.loads(l[5:]) for l in r.text.splitlines()
-              if l.startswith("data:") and l[5:].strip() != "[DONE]"]
+    events = [json.loads(ln[5:]) for ln in r.text.splitlines() if ln.startswith("data:") and ln[5:].strip() != "[DONE]"]
     finished = False
     for e in events:
         for ch in e["choices"]:
@@ -99,10 +98,18 @@ async def test_no_content_after_finish_and_no_empty_chunks():
 
 # ---- helpers: a fake upstream that speaks SSE lines and records whether it was closed
 
+
 def _evt(index, content=None, finish=None):
     delta = {} if content is None else {"content": content}
-    return "data: " + json.dumps({"id": "x", "object": "chat.completion.chunk", "created": 0, "model": "m",
-                                  "choices": [{"index": index, "delta": delta, "finish_reason": finish}]})
+    return "data: " + json.dumps(
+        {
+            "id": "x",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "m",
+            "choices": [{"index": index, "delta": delta, "finish_reason": finish}],
+        }
+    )
 
 
 class FakeUpstream:
@@ -125,9 +132,9 @@ async def test_upstream_closed_when_client_disconnects_mid_stream():
     for _ in range(3):
         await gen.__anext__()
     assert not up.closed
-    await gen.aclose()                      # what Starlette does when the client goes away
+    await gen.aclose()  # what Starlette does when the client goes away
     assert up.closed
-    assert up.lines_served < 10             # we stopped pulling from upstream immediately
+    assert up.lines_served < 10  # we stopped pulling from upstream immediately
 
 
 async def test_upstream_closed_on_normal_completion_and_on_error():
@@ -146,9 +153,8 @@ async def test_upstream_closed_on_normal_completion_and_on_error():
 
 
 async def test_multiple_choices_are_redacted_independently():
-    texts = {0: "Mail bob.smith@example.com today, ok?",
-             1: "Card 4111 1111 1111 1111 and SSN 123-45-6789 end."}
-    chunks = {i: [t[k:k + 3] for k in range(0, len(t), 3)] for i, t in texts.items()}
+    texts = {0: "Mail bob.smith@example.com today, ok?", 1: "Card 4111 1111 1111 1111 and SSN 123-45-6789 end."}
+    chunks = {i: [t[k : k + 3] for k in range(0, len(t), 3)] for i, t in texts.items()}
     lines = [_evt(0), _evt(1)]
     for k in range(max(map(len, chunks.values()))):  # interleave the two choices chunk by chunk
         for i in (0, 1):
@@ -175,6 +181,12 @@ async def test_invalid_json_body_is_400_and_non_object_events_are_skipped():
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://gw") as c:
         assert (await c.post("/v1/chat/completions", content=b"{nope")).status_code == 400
         assert (await c.post("/v1/chat/completions", json=[1, 2])).status_code == 400
-    out = b"".join([c async for c in gateway.redacted_stream(
-        FakeUpstream(["data: 5", 'data: "str"', _evt(0, "ok "), _evt(0, None, "stop"), "data: [DONE]"]))])
+    out = b"".join(
+        [
+            c
+            async for c in gateway.redacted_stream(
+                FakeUpstream(["data: 5", 'data: "str"', _evt(0, "ok "), _evt(0, None, "stop"), "data: [DONE]"])
+            )
+        ]
+    )
     assert b'"ok "' in out

@@ -1,28 +1,36 @@
 """Wire-level tests: spawn the server, speak raw JSON-RPC over pipes, assert stdout purity."""
+
 import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
-from pathlib import Path
 
 SERVER = Path(__file__).with_name("server.py")
 
 
 def run_session(calls):
     msgs = [
-        {"jsonrpc": "2.0", "id": 0, "method": "initialize",
-         "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                    "clientInfo": {"name": "t", "version": "0"}}},
+        {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "t", "version": "0"},
+            },
+        },
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
     ]
     for i, (name, args) in enumerate(calls, start=2):
-        msgs.append({"jsonrpc": "2.0", "id": i, "method": "tools/call",
-                     "params": {"name": name, "arguments": args}})
-    p = subprocess.Popen([sys.executable, str(SERVER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, text=True)
+        msgs.append({"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": name, "arguments": args}})
+    p = subprocess.Popen(
+        [sys.executable, str(SERVER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
     for m in msgs:
         p.stdin.write(json.dumps(m) + "\n")
     p.stdin.flush()
@@ -71,15 +79,18 @@ def test_invalid_inputs_return_jsonrpc_invalid_params():
 
 
 def test_valid_refund_and_not_found():
-    by_id, _ = run_session([
-        ("trigger_refund", {"customer_id": "CUST-00042", "amount": 19.99, "reason": "Item arrived damaged"}),
-        ("trigger_refund", {"customer_id": "CUST-99999", "amount": 5, "reason": "Item arrived damaged"}),
-    ])
+    by_id, _ = run_session(
+        [
+            ("trigger_refund", {"customer_id": "CUST-00042", "amount": 19.99, "reason": "Item arrived damaged"}),
+            ("trigger_refund", {"customer_id": "CUST-99999", "amount": 5, "reason": "Item arrived damaged"}),
+        ]
+    )
     assert "Refund RF-" in by_id[2]["result"]["content"][0]["text"]
     assert by_id[3]["result"]["isError"] is True
 
 
 # ---- reference-client test: official SDK ClientSession over a real stdio subprocess
+
 
 async def _with_sdk_client(fn):
     from mcp import ClientSession, StdioServerParameters
@@ -101,14 +112,16 @@ async def test_official_sdk_client_end_to_end():
         schemas = {t.name: t.input_schema for t in tools.tools}
 
         ok = await session.call_tool("get_customer_record", {"customer_id": "CUST-00001"})
-        refund = await session.call_tool("trigger_refund", {
-            "customer_id": "CUST-00042", "amount": 19.99, "reason": "Item arrived damaged"})
+        refund = await session.call_tool(
+            "trigger_refund", {"customer_id": "CUST-00042", "amount": 19.99, "reason": "Item arrived damaged"}
+        )
         missing = await session.call_tool("get_customer_record", {"customer_id": "CUST-99999"})
         with pytest.raises(MCPError) as bad_id:
             await session.call_tool("get_customer_record", {"customer_id": "nope"})
         with pytest.raises(MCPError) as bad_amount:
-            await session.call_tool("trigger_refund", {
-                "customer_id": "CUST-00001", "amount": -1, "reason": "long enough reason"})
+            await session.call_tool(
+                "trigger_refund", {"customer_id": "CUST-00001", "amount": -1, "reason": "long enough reason"}
+            )
         # session still healthy after protocol errors
         again = await session.call_tool("get_customer_record", {"customer_id": "CUST-00042"})
         return names, schemas, ok, refund, missing, bad_id.value, bad_amount.value, again
@@ -119,7 +132,7 @@ async def test_official_sdk_client_end_to_end():
     assert schemas["trigger_refund"]["properties"]["reason"]["minLength"] == 10
     assert not ok.is_error and "Ada Lovelace" in ok.content[0].text
     assert "Refund RF-" in refund.content[0].text
-    assert missing.is_error is True                      # business error: tool result, not protocol error
+    assert missing.is_error is True  # business error: tool result, not protocol error
     assert bad_id.code == -32602 and bad_amount.code == -32602
     assert [e["field"] for e in bad_amount.data["errors"]] == ["amount"]
     assert not again.is_error and "Alan Turing" in again.content[0].text

@@ -1,5 +1,4 @@
 import asyncio
-import json
 import time
 
 import httpx
@@ -8,8 +7,7 @@ import pytest
 from ratelimit import SlidingWindowTokenLimiter, tenant_hash
 from router import Provider, Settings, create_app
 
-OK = {"choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}],
-      "usage": {"total_tokens": 15}}
+OK = {"choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}], "usage": {"total_tokens": 15}}
 
 
 def make(tmp_path, primary, secondary=lambda r: httpx.Response(200, json=OK), tpm=50_000, timeout=0.3, total=6.0):
@@ -18,9 +16,15 @@ def make(tmp_path, primary, secondary=lambda r: httpx.Response(200, json=OK), tp
         out = fn(request)
         return await out if asyncio.iscoroutine(out) else out
 
-    s = Settings(db_path=str(tmp_path / "rl.db"), tokens_per_minute=tpm, total_timeout_s=total, providers=[
-        Provider("primary", "http://primary/v1/chat/completions", "m1", timeout_s=timeout),
-        Provider("secondary", "http://secondary/v1/chat/completions", "m2", timeout_s=timeout)])
+    s = Settings(
+        db_path=str(tmp_path / "rl.db"),
+        tokens_per_minute=tpm,
+        total_timeout_s=total,
+        providers=[
+            Provider("primary", "http://primary/v1/chat/completions", "m1", timeout_s=timeout),
+            Provider("secondary", "http://secondary/v1/chat/completions", "m2", timeout_s=timeout),
+        ],
+    )
     app = create_app(s, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     return app, httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gw")
 
@@ -55,8 +59,11 @@ async def test_failover_on_timeout_is_bounded(tmp_path):
 
 
 async def test_both_fail_sanitized_and_reservation_released(tmp_path):
-    app, c = make(tmp_path, lambda r: httpx.Response(500, text="Traceback: db password=hunter2"),
-                  lambda r: (_ for _ in ()).throw(httpx.ConnectError("10.0.0.7:443 refused")))
+    app, c = make(
+        tmp_path,
+        lambda r: httpx.Response(500, text="Traceback: db password=hunter2"),
+        lambda r: (_ for _ in ()).throw(httpx.ConnectError("10.0.0.7:443 refused")),
+    )
     r = await c.post("/v1/chat/completions", json=BODY, headers=H)
     assert r.status_code == 503
     err = r.json()["error"]
@@ -67,8 +74,11 @@ async def test_both_fail_sanitized_and_reservation_released(tmp_path):
 
 async def test_4xx_not_failed_over(tmp_path):
     calls = []
-    _, c = make(tmp_path, lambda r: httpx.Response(400, json={"internal": "x"}),
-                lambda r: calls.append(1) or httpx.Response(200, json=OK))
+    _, c = make(
+        tmp_path,
+        lambda r: httpx.Response(400, json={"internal": "x"}),
+        lambda r: calls.append(1) or httpx.Response(200, json=OK),
+    )
     r = await c.post("/v1/chat/completions", json=BODY, headers=H)
     assert r.status_code == 400 and r.json()["error"]["code"] == "upstream_rejected" and not calls
 
@@ -76,6 +86,7 @@ async def test_4xx_not_failed_over(tmp_path):
 async def test_unexpected_exception_sanitized(tmp_path):
     def boom(r):
         raise RuntimeError("SECRET internal detail")
+
     _, c = make(tmp_path, boom, boom)
     r = await c.post("/v1/chat/completions", json=BODY, headers=H)
     assert r.status_code == 500 and "SECRET" not in r.text and r.json()["error"]["code"] == "internal_error"
@@ -94,6 +105,7 @@ async def test_concurrent_admission_never_exceeds_limit(tmp_path):
     async def slow_ok(r):
         await asyncio.sleep(0.05)
         return httpx.Response(200, json={**OK, "usage": {"total_tokens": 108}})
+
     _, c = make(tmp_path, slow_ok, tpm=1000)
     rs = await asyncio.gather(*[c.post("/v1/chat/completions", json=BODY, headers=H) for _ in range(30)])
     codes = [r.status_code for r in rs]
@@ -136,6 +148,7 @@ def test_state_persists_on_disk(tmp_path):
 
 # ---- regressions for bugs found in review
 
+
 async def test_non_object_messages_rejected_not_500(tmp_path):
     _, c = make(tmp_path, lambda r: httpx.Response(200, json=OK))
     r = await c.post("/v1/chat/completions", json={"messages": ["hi"]}, headers=H)
@@ -152,10 +165,12 @@ async def test_request_larger_than_window_is_400_not_retryable_429(tmp_path):
 
 async def test_rate_limit_store_failure_is_sanitized_503(tmp_path):
     import sqlite3
+
     app, c = make(tmp_path, lambda r: httpx.Response(200, json=OK))
 
     def locked(*a):
         raise sqlite3.OperationalError("database is locked: /var/secret/rl.db")
+
     app.state.limiter._reserve_sync = locked
     r = await c.post("/v1/chat/completions", json=BODY, headers=H)
     assert r.status_code == 503 and r.json()["error"]["code"] == "rate_limiter_unavailable"
@@ -163,6 +178,7 @@ async def test_rate_limit_store_failure_is_sanitized_503(tmp_path):
 
 
 # ---- overall deadline
+
 
 async def test_total_deadline_bounds_latency(tmp_path):
     async def slow(r):
@@ -184,13 +200,13 @@ async def test_exhausted_deadline_skips_secondary(tmp_path):
     async def slow(r):
         await asyncio.sleep(5)
 
-    _, c = make(tmp_path, slow, lambda r: seen.append(1) or httpx.Response(200, json=OK),
-                timeout=0.3, total=0.3)
+    _, c = make(tmp_path, slow, lambda r: seen.append(1) or httpx.Response(200, json=OK), timeout=0.3, total=0.3)
     r = await c.post("/v1/chat/completions", json=BODY, headers=H)
     assert r.status_code == 503 and not seen
 
 
 # ---- background sweep of idle tenants
+
 
 def test_sweep_evicts_idle_tenants_in_batches(tmp_path):
     now = [1000.0]
@@ -201,7 +217,7 @@ def test_sweep_evicts_idle_tenants_in_batches(tmp_path):
     now[0] = 1050
     lim._reserve_sync("fresh", 10)
     now[0] = 1061  # the six old rows expired; "fresh" has not
-    assert lim._sweep_sync(batch=4) == 4          # bounded: only one batch per transaction
+    assert lim._sweep_sync(batch=4) == 4  # bounded: only one batch per transaction
     assert lim._sweep_sync(batch=4) == 2
     left = lim._conn.execute("SELECT tenant FROM token_usage").fetchall()
     assert left == [("fresh",)]

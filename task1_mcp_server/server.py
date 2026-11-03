@@ -17,6 +17,7 @@ Error mapping (JSON-RPC 2.0):
   Business outcomes (e.g. customer not found) are returned as a tool result with
   isError=true — that's the MCP convention for errors the model should see and act on.
 """
+
 from __future__ import annotations
 
 import json
@@ -28,12 +29,11 @@ from decimal import Decimal
 from typing import Any
 
 import anyio
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
-
 from mcp import types
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import MCPError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 logging.basicConfig(
     stream=sys.stderr,
@@ -76,7 +76,8 @@ class TriggerRefundInput(_Strict):
     @field_validator("amount")
     @classmethod
     def _max_two_decimals(cls, v: float) -> float:
-        if Decimal(str(v)).as_tuple().exponent < -2:
+        exponent = Decimal(str(v)).as_tuple().exponent  # 'n'/'N'/'F' only for NaN/Inf, rejected earlier
+        if isinstance(exponent, int) and exponent < -2:
             raise ValueError("amount may have at most 2 decimal places")
         return v
 

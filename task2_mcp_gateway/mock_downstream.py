@@ -1,4 +1,5 @@
 """Mock downstream MCP server (JSON-RPC over HTTP). Counts calls so tests can prove short-circuiting."""
+
 import os
 
 from fastapi import FastAPI, Request
@@ -21,8 +22,11 @@ def handle(msg: dict):
         return {"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": TOOLS}}
     if msg["method"] == "tools/call":
         name = msg["params"]["name"]
-        return {"jsonrpc": "2.0", "id": msg["id"],
-                "result": {"content": [{"type": "text", "text": f"ran {name}"}], "isError": False}}
+        return {
+            "jsonrpc": "2.0",
+            "id": msg["id"],
+            "result": {"content": [{"type": "text", "text": f"ran {name}"}], "isError": False},
+        }
     return {"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "Method not found"}}
 
 
@@ -39,4 +43,5 @@ async def mcp(req: Request):
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("PORT", 9000)))

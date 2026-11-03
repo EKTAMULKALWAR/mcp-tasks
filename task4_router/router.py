@@ -12,6 +12,7 @@ Flow per request:
 Standard error payload:
   {"error": {"type": "...", "code": "...", "message": "...", "request_id": "..."}}
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -40,6 +41,7 @@ log = logging.getLogger("llm-router")
 
 # ------------------------------------------------------------------ config
 
+
 @dataclass
 class Provider:
     name: str
@@ -56,15 +58,26 @@ class Settings:
     default_max_tokens: int = 1024
     total_timeout_s: float = float(os.environ.get("GATEWAY_TOTAL_TIMEOUT", 6.0))  # all attempts combined
     sweep_interval_s: float = float(os.environ.get("RATE_SWEEP_INTERVAL", 30.0))
-    providers: list[Provider] = field(default_factory=lambda: [
-        Provider("primary", os.environ.get("PRIMARY_URL", "http://127.0.0.1:9201/v1/chat/completions"),
-                 os.environ.get("PRIMARY_MODEL", "gpt-primary"), os.environ.get("PRIMARY_KEY", "")),
-        Provider("secondary", os.environ.get("SECONDARY_URL", "http://127.0.0.1:9202/v1/chat/completions"),
-                 os.environ.get("SECONDARY_MODEL", "claude-backup"), os.environ.get("SECONDARY_KEY", "")),
-    ])
+    providers: list[Provider] = field(
+        default_factory=lambda: [
+            Provider(
+                "primary",
+                os.environ.get("PRIMARY_URL", "http://127.0.0.1:9201/v1/chat/completions"),
+                os.environ.get("PRIMARY_MODEL", "gpt-primary"),
+                os.environ.get("PRIMARY_KEY", ""),
+            ),
+            Provider(
+                "secondary",
+                os.environ.get("SECONDARY_URL", "http://127.0.0.1:9202/v1/chat/completions"),
+                os.environ.get("SECONDARY_MODEL", "claude-backup"),
+                os.environ.get("SECONDARY_KEY", ""),
+            ),
+        ]
+    )
 
 
 # ------------------------------------------------------------------ errors
+
 
 class GatewayError(Exception):
     def __init__(self, status: int, type_: str, code: str, message: str, headers: dict | None = None):
@@ -75,7 +88,9 @@ class GatewayError(Exception):
 def error_response(err: GatewayError, request_id: str) -> JSONResponse:
     return JSONResponse(
         {"error": {"type": err.type, "code": err.code, "message": err.message, "request_id": request_id}},
-        status_code=err.status, headers={**err.headers, "X-Request-Id": request_id})
+        status_code=err.status,
+        headers={**err.headers, "X-Request-Id": request_id},
+    )
 
 
 class RetryableUpstream(Exception):
@@ -83,6 +98,7 @@ class RetryableUpstream(Exception):
 
 
 # ------------------------------------------------------------------ helpers
+
 
 def estimate_prompt_tokens(body: dict) -> int:
     # ~4 chars/token heuristic + per-message overhead; swap in tiktoken for exact counts.
@@ -95,16 +111,21 @@ def estimate_prompt_tokens(body: dict) -> int:
 
 def validate_body(body: object) -> dict:
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list) or not body["messages"]:
-        raise GatewayError(400, "invalid_request_error", "invalid_body", "Body must include a non-empty 'messages' list")
+        raise GatewayError(
+            400, "invalid_request_error", "invalid_body", "Body must include a non-empty 'messages' list"
+        )
     if not all(isinstance(m, dict) for m in body["messages"]):
         raise GatewayError(400, "invalid_request_error", "invalid_body", "Each message must be an object")
     mt = body.get("max_tokens")
     if mt is not None and (not isinstance(mt, int) or isinstance(mt, bool) or mt <= 0):
-        raise GatewayError(400, "invalid_request_error", "invalid_max_tokens", "'max_tokens' must be a positive integer")
+        raise GatewayError(
+            400, "invalid_request_error", "invalid_max_tokens", "'max_tokens' must be a positive integer"
+        )
     return body
 
 
 # ------------------------------------------------------------------ router
+
 
 class ModelRouter:
     def __init__(self, settings: Settings, client: httpx.AsyncClient, limiter: SlidingWindowTokenLimiter):
@@ -133,8 +154,9 @@ class ModelRouter:
             raise RetryableUpstream(str(resp.status_code))
         if resp.status_code >= 400:
             log.info("[%s] %s rejected request %d: %.200s", request_id, p.name, resp.status_code, resp.text)
-            raise GatewayError(400, "invalid_request_error", "upstream_rejected",
-                               "The model provider rejected the request")
+            raise GatewayError(
+                400, "invalid_request_error", "upstream_rejected", "The model provider rejected the request"
+            )
         try:
             data = resp.json()
             data["choices"]  # minimal shape check
@@ -147,24 +169,37 @@ class ModelRouter:
         tenant = tenant_hash(api_key)
         cost = estimate_prompt_tokens(body) + body.get("max_tokens", self.s.default_max_tokens)
         if cost > self.limiter.limit:  # can never fit in any window: a retry would not help
-            raise GatewayError(400, "invalid_request_error", "request_too_large",
-                               f"Estimated request size exceeds the {self.limiter.limit}-token window; "
-                               "reduce the prompt or max_tokens")
+            raise GatewayError(
+                400,
+                "invalid_request_error",
+                "request_too_large",
+                f"Estimated request size exceeds the {self.limiter.limit}-token window; "
+                "reduce the prompt or max_tokens",
+            )
         try:
             decision = await self.limiter.reserve(tenant, cost)
         except sqlite3.Error:
             log.exception("[%s] rate-limit store unavailable", request_id)
-            raise GatewayError(503, "upstream_unavailable", "rate_limiter_unavailable",
-                               "Service temporarily unavailable. Please retry shortly.", {"Retry-After": "1"})
-        rl_headers = {"X-RateLimit-Limit": str(decision.limit),
-                      "X-RateLimit-Remaining": str(decision.remaining)}
+            raise GatewayError(
+                503,
+                "upstream_unavailable",
+                "rate_limiter_unavailable",
+                "Service temporarily unavailable. Please retry shortly.",
+                {"Retry-After": "1"},
+            )
+        rl_headers = {"X-RateLimit-Limit": str(decision.limit), "X-RateLimit-Remaining": str(decision.remaining)}
         if not decision.allowed:
             retry = max(1, int(decision.retry_after + 0.999))
-            raise GatewayError(429, "rate_limit_error", "tenant_token_limit",
-                               f"Token rate limit of {decision.limit}/min exceeded",
-                               {**rl_headers, "Retry-After": str(retry)})
+            raise GatewayError(
+                429,
+                "rate_limit_error",
+                "tenant_token_limit",
+                f"Token rate limit of {decision.limit}/min exceeded",
+                {**rl_headers, "Retry-After": str(retry)},
+            )
 
         rid, settled = decision.reservation_id, False
+        assert rid is not None  # allowed decisions always carry a reservation
         deadline = time.monotonic() + self.s.total_timeout_s
         try:
             for i, p in enumerate(self.s.providers):
@@ -177,16 +212,21 @@ class ModelRouter:
                     data = await self._attempt(p, body, request_id, budget)
                 except RetryableUpstream as why:
                     if i + 1 < len(self.s.providers):
-                        log.info("[%s] failing over %s -> %s (%s)", request_id, p.name,
-                                 self.s.providers[i + 1].name, why)
+                        log.info(
+                            "[%s] failing over %s -> %s (%s)", request_id, p.name, self.s.providers[i + 1].name, why
+                        )
                     continue
                 usage = (data.get("usage") or {}).get("total_tokens")
                 await self.limiter.settle(rid, usage if isinstance(usage, int) else cost)
                 settled = True
                 return data, {**rl_headers, "X-Gateway-Provider": p.name}
-            raise GatewayError(503, "upstream_unavailable", "all_providers_failed",
-                               "All model providers are currently unavailable. Please retry shortly.",
-                               {**rl_headers, "Retry-After": "2"})
+            raise GatewayError(
+                503,
+                "upstream_unavailable",
+                "all_providers_failed",
+                "All model providers are currently unavailable. Please retry shortly.",
+                {**rl_headers, "Retry-After": "2"},
+            )
         finally:
             if not settled:
                 # nothing was consumed; shield so a client disconnect can't leak the reservation
@@ -195,8 +235,10 @@ class ModelRouter:
 
 # ------------------------------------------------------------------ app
 
+
 def create_app(settings: Settings | None = None, client: httpx.AsyncClient | None = None) -> FastAPI:
     settings = settings or Settings()
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         app.state.sweeper = asyncio.create_task(app.state.limiter.run_sweeper(settings.sweep_interval_s))
@@ -220,8 +262,10 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
         except Exception:
             # last line of defence: log the trace, return nothing internal
             log.exception("[%s] unhandled error", request.state.request_id)
-            return error_response(GatewayError(500, "internal_error", "internal_error",
-                                               "An internal error occurred"), request.state.request_id)
+            return error_response(
+                GatewayError(500, "internal_error", "internal_error", "An internal error occurred"),
+                request.state.request_id,
+            )
 
     @app.exception_handler(GatewayError)
     async def _ge(request: Request, exc: GatewayError):
@@ -229,14 +273,21 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
 
     @app.exception_handler(StarletteHTTPException)
     async def _he(request: Request, exc: StarletteHTTPException):
-        return error_response(GatewayError(exc.status_code, "invalid_request_error", "http_error",
-                                           "Not found" if exc.status_code == 404 else "Request error"),
-                              request.state.request_id)
+        return error_response(
+            GatewayError(
+                exc.status_code,
+                "invalid_request_error",
+                "http_error",
+                "Not found" if exc.status_code == 404 else "Request error",
+            ),
+            request.state.request_id,
+        )
 
     @app.exception_handler(RequestValidationError)
     async def _ve(request: Request, exc: RequestValidationError):
-        return error_response(GatewayError(400, "invalid_request_error", "invalid_body", "Malformed request"),
-                              request.state.request_id)
+        return error_response(
+            GatewayError(400, "invalid_request_error", "invalid_body", "Malformed request"), request.state.request_id
+        )
 
     @app.post("/v1/chat/completions")
     async def completions(request: Request):
@@ -244,13 +295,17 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
         auth = request.headers.get("authorization", "")
         scheme, _, key = auth.partition(" ")
         if scheme.lower() != "bearer" or not key.strip():
-            raise GatewayError(401, "authentication_error", "missing_api_key", "Provide 'Authorization: Bearer <api key>'")
+            raise GatewayError(
+                401, "authentication_error", "missing_api_key", "Provide 'Authorization: Bearer <api key>'"
+            )
         try:
             body = validate_body(json.loads(await request.body()))
         except json.JSONDecodeError:
             raise GatewayError(400, "invalid_request_error", "invalid_json", "Body is not valid JSON")
         if body.get("stream"):
-            raise GatewayError(400, "invalid_request_error", "stream_unsupported", "Streaming not supported on this route")
+            raise GatewayError(
+                400, "invalid_request_error", "stream_unsupported", "Streaming not supported on this route"
+            )
         data, headers = await app.state.router.complete(key.strip(), body, rid)
         return JSONResponse(data, headers={**headers, "X-Request-Id": rid})
 
@@ -259,4 +314,5 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(create_app(), host="127.0.0.1", port=int(os.environ.get("PORT", 8100)))

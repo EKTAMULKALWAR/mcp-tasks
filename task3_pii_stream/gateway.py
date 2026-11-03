@@ -17,14 +17,15 @@ Latency/memory design:
 Run:  python mock_provider.py   (port 9100)
       PROVIDER_URL=http://127.0.0.1:9100/v1/chat/completions python gateway.py  (port 8090)
 """
+
 from __future__ import annotations
 
 import json
 import logging
 import os
 import sys
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
 
 import httpx
 from fastapi import FastAPI, Request
@@ -104,8 +105,7 @@ async def redacted_stream(upstream: httpx.Response) -> AsyncIterator[bytes]:
         for idx, r in redactors.items():
             tail = r.flush()
             if tail:
-                yield sse({**last_meta, "choices": [{"index": idx, "delta": {"content": tail},
-                                                     "finish_reason": None}]})
+                yield sse({**last_meta, "choices": [{"index": idx, "delta": {"content": tail}, "finish_reason": None}]})
         yield sse("[DONE]")
     except httpx.HTTPError as exc:
         log.error("upstream stream broke: %s", exc.__class__.__name__)
@@ -119,22 +119,25 @@ async def completions(req: Request):
     try:
         body = await req.json()
     except ValueError:
-        return JSONResponse({"error": {"type": "invalid_request_error", "message": "Body is not valid JSON"}},
-                            status_code=400)
+        return JSONResponse(
+            {"error": {"type": "invalid_request_error", "message": "Body is not valid JSON"}}, status_code=400
+        )
     if not isinstance(body, dict):
-        return JSONResponse({"error": {"type": "invalid_request_error", "message": "Body must be a JSON object"}},
-                            status_code=400)
+        return JSONResponse(
+            {"error": {"type": "invalid_request_error", "message": "Body must be a JSON object"}}, status_code=400
+        )
     headers = {"Authorization": f"Bearer {PROVIDER_KEY}"} if PROVIDER_KEY else {}
     try:
         upstream = await client.send(
-            client.build_request("POST", PROVIDER_URL, json=body, headers=headers), stream=True)
+            client.build_request("POST", PROVIDER_URL, json=body, headers=headers), stream=True
+        )
     except httpx.HTTPError:
-        return JSONResponse({"error": {"type": "upstream_unavailable", "message": "Provider unavailable"}},
-                            status_code=502)
+        return JSONResponse(
+            {"error": {"type": "upstream_unavailable", "message": "Provider unavailable"}}, status_code=502
+        )
     if upstream.status_code != 200:
         await upstream.aclose()
-        return JSONResponse({"error": {"type": "upstream_error", "status": upstream.status_code}},
-                            status_code=502)
+        return JSONResponse({"error": {"type": "upstream_error", "status": upstream.status_code}}, status_code=502)
 
     if not body.get("stream"):
         data = json.loads(await upstream.aread())
@@ -145,10 +148,14 @@ async def completions(req: Request):
                 msg["content"] = redact(msg["content"])
         return JSONResponse(data)
 
-    return StreamingResponse(redacted_stream(upstream), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return StreamingResponse(
+        redacted_stream(upstream),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("PORT", 8090)))
