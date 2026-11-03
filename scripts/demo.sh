@@ -11,6 +11,8 @@ PIDS=()
 
 cleanup() {
   for pid in ${PIDS[@]+"${PIDS[@]}"}; do kill "$pid" 2>/dev/null; done
+  sleep 1  # grace period; then force-kill stragglers (e.g. the "slow" mock holding an in-flight request)
+  for pid in ${PIDS[@]+"${PIDS[@]}"}; do kill -9 "$pid" 2>/dev/null; done
   wait 2>/dev/null
   rm -rf "$TMP"
 }
