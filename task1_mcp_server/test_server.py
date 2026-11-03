@@ -65,6 +65,7 @@ BAD = [
     ("trigger_refund", {"customer_id": "CUST-00001", "amount": "10", "reason": "damaged item"}),
     ("trigger_refund", {"customer_id": "CUST-00001", "amount": True, "reason": "damaged item"}),
     ("trigger_refund", {"customer_id": "CUST-00001", "amount": 10.123, "reason": "damaged item"}),
+    ("trigger_refund", {"customer_id": "CUST-00001", "amount": 1000000.01, "reason": "damaged item"}),
     ("trigger_refund", {"customer_id": "CUST-00001", "amount": 10, "reason": "short"}),
     ("trigger_refund", {"customer_id": "CUST-00001", "amount": 10, "reason": "   a      "}),
     ("no_such_tool", {}),
