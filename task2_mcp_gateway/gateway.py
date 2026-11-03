@@ -37,6 +37,7 @@ log = logging.getLogger("mcp-gateway")
 
 DOWNSTREAM_URL = os.environ.get("DOWNSTREAM_URL", "http://127.0.0.1:9000/mcp")
 JWT_SECRET = os.environ.get("GATEWAY_JWT_SECRET", "dev-only-secret-change-me-0123456789abcdef")
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", 1_048_576))  # 1 MiB
 ALLOWED_ROLES = {"admin", "viewer"}
 ADMIN_PREFIX = "admin_"
 
@@ -135,6 +136,22 @@ def response_headers(resp: httpx.Response) -> dict[str, str]:
     return {k: v for k, v in resp.headers.items() if k.lower() not in HOP_BY_HOP | {"content-encoding"}}
 
 
+async def read_body_capped(req: Request, limit: int) -> bytes | None:
+    """Read the request body, giving up (None) as soon as it exceeds `limit` bytes,
+    so an oversized upload is never fully buffered."""
+    declared = req.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        return None
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in req.stream():
+        size += len(chunk)
+        if size > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 @app.post("/mcp")
 async def mcp_endpoint(req: Request) -> Response:
     # 1. authenticate (before even parsing, so unauthenticated callers learn nothing)
@@ -146,7 +163,10 @@ async def mcp_endpoint(req: Request) -> Response:
                             headers={"WWW-Authenticate": 'Bearer error="invalid_token"'})
 
     # 2. parse wire format
-    raw = await req.body()
+    raw = await read_body_capped(req, MAX_BODY_BYTES)
+    if raw is None:
+        return JSONResponse(rpc_error(None, INVALID_REQUEST, "Request body too large",
+                                      {"max_bytes": MAX_BODY_BYTES}), status_code=413)
     try:
         payload = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError):

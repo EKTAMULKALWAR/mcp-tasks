@@ -93,3 +93,72 @@ async def test_downstream_down_returns_jsonrpc_error(gw):
         httpx.ConnectError("boom"))))
     r = await gw.post("/mcp", json=call("get_weather", 4), headers=auth("viewer"))
     assert r.status_code == 502 and r.json()["error"]["code"] == -32003
+
+
+# ---- JWT algorithm confusion
+
+PAYLOAD = {"sub": "u1", "role": "admin", "exp": int(time.time()) + 300}
+
+
+@pytest.mark.parametrize("tok", [
+    jwt.encode(PAYLOAD, None, algorithm="none"),                       # unsigned token
+    jwt.encode(PAYLOAD, gateway.JWT_SECRET, algorithm="HS512"),        # right key, wrong algorithm
+    jwt.encode(PAYLOAD, gateway.JWT_SECRET, algorithm="HS384"),
+    jwt.encode(PAYLOAD, gateway.JWT_SECRET, algorithm="HS256") + "x",  # tampered signature
+], ids=["alg-none", "hs512", "hs384", "bad-signature"])
+async def test_algorithm_confusion_rejected(gw, tok):
+    r = await gw.post("/mcp", json=call("admin_reset_key"), headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 401 and r.json()["error"]["code"] == -32000
+    assert mock_downstream.app.state.calls == []
+
+
+# ---- notifications never get a response body
+
+async def test_denied_notification_gets_no_response_body(gw):
+    note = {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "admin_reset_key"}}
+    r = await gw.post("/mcp", json=note, headers=auth("viewer"))
+    assert r.status_code == 202 and r.content == b""
+    assert mock_downstream.app.state.calls == []  # denied, so not forwarded either
+
+
+async def test_denied_notification_in_batch_is_omitted_from_results(gw):
+    batch = [{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "admin_reset_key"}},
+             call("admin_reset_key", 5)]
+    r = await gw.post("/mcp", json=batch, headers=auth("viewer"))
+    assert [m["id"] for m in r.json()] == [5]  # only the request with an id is answered
+
+
+async def test_allowed_notification_has_no_body(gw):
+    r = await gw.post("/mcp", json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+                      headers=auth("viewer"))
+    assert r.status_code == 202 and r.content == b""
+
+
+# ---- body size limit
+
+async def test_oversized_body_rejected_without_forwarding(gw, monkeypatch):
+    monkeypatch.setattr(gateway, "MAX_BODY_BYTES", 200)
+    big = call("get_weather")
+    big["params"]["arguments"] = {"pad": "x" * 500}
+    r = await gw.post("/mcp", json=big, headers=auth("admin"))
+    assert r.status_code == 413
+    assert r.json()["error"]["code"] == -32600 and r.json()["error"]["data"] == {"max_bytes": 200}
+    assert mock_downstream.app.state.calls == []
+
+
+async def test_oversized_chunked_body_without_content_length(gw, monkeypatch):
+    monkeypatch.setattr(gateway, "MAX_BODY_BYTES", 100)
+
+    async def body():  # no Content-Length -> must be capped while streaming
+        for _ in range(10):
+            yield b"x" * 50
+    r = await gw.post("/mcp", content=body(), headers=auth("admin"))
+    assert r.status_code == 413 and mock_downstream.app.state.calls == []
+
+
+async def test_body_at_limit_is_accepted(gw, monkeypatch):
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    import json as _json
+    monkeypatch.setattr(gateway, "MAX_BODY_BYTES", len(_json.dumps(payload).encode()) + 5)
+    r = await gw.post("/mcp", json=payload, headers=auth("viewer"))
+    assert r.status_code == 200 and "tools" in r.json()["result"]
