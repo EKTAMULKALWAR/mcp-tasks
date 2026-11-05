@@ -37,7 +37,9 @@ logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %
 log = logging.getLogger("mcp-gateway")
 
 DOWNSTREAM_URL = os.environ.get("DOWNSTREAM_URL", "http://127.0.0.1:9000/mcp")
-JWT_SECRET = os.environ.get("GATEWAY_JWT_SECRET", "dev-only-secret-change-me-0123456789abcdef")
+DEV_JWT_SECRET = "dev-only-secret-change-me-0123456789abcdef"  # public in the repo: never use outside development
+JWT_SECRET = os.environ.get("GATEWAY_JWT_SECRET") or DEV_JWT_SECRET  # empty counts as unset
+USING_DEV_SECRET = JWT_SECRET == DEV_JWT_SECRET
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", 1_048_576))  # 1 MiB
 ALLOWED_ROLES = {"admin", "viewer"}
 ADMIN_PREFIX = "admin_"
@@ -128,6 +130,11 @@ client: httpx.AsyncClient | None = None
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global client
+    if USING_DEV_SECRET:
+        log.warning(
+            "GATEWAY_JWT_SECRET is not set: signing/verifying tokens with the public development secret. "
+            "Anyone who has read the source can mint an admin token. Set GATEWAY_JWT_SECRET (32+ bytes)."
+        )
     client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0))
     yield
     await client.aclose()

@@ -35,7 +35,7 @@ process and has no port. All servers bind to `127.0.0.1`.
 | Service | Default port | Notes |
 |---|---|---|
 | Task 2 `mock_downstream.py` | 9000 | gateway reaches it via `DOWNSTREAM_URL` (default `http://127.0.0.1:9000/mcp`) |
-| Task 2 `gateway.py` | 8080 | `GATEWAY_JWT_SECRET`, `MAX_BODY_BYTES` (default 1048576) |
+| Task 2 `gateway.py` | 8080 | `GATEWAY_JWT_SECRET` (**set it**; if unset or empty the gateway falls back to a public development secret and logs a WARNING at startup), `MAX_BODY_BYTES` (default 1048576) |
 | Task 3 `mock_provider.py` | 9100 | gateway reaches it via `PROVIDER_URL` (default `http://127.0.0.1:9100/v1/chat/completions`) |
 | Task 3 `gateway.py` | 8090 | `PROVIDER_API_KEY` optional |
 | Task 4 `mock_providers.py` | argument | `python mock_providers.py <name> <port> ok\|429\|slow\|500`; the router expects 9201 (primary) and 9202 (secondary) |
@@ -152,6 +152,10 @@ Edge cases handled (tests): `alg: none` token, right key with HS512/HS384 (algor
 signature, expired token, wrong secret, unknown role, missing/`Basic`/empty bearer, malformed JSON, empty batch,
 missing `jsonrpc`, non-string tool name, denied notification alone and inside a batch, oversized body (declared
 and chunked without `Content-Length`), body exactly at the limit, downstream down.
+
+> **Secret handling:** tokens are verified with `GATEWAY_JWT_SECRET`. If it is unset (or empty) the gateway falls back
+> to a development secret that is public in this repository, so anyone could mint an admin token; it logs a `WARNING`
+> at startup saying so. `make demo` and the manual commands below always set a real secret.
 
 > Design note: JSON-RPC errors (including `-32001`) are returned with HTTP 200, per JSON-RPC-over-HTTP
 > convention; only auth failures (401), oversized bodies (413) and downstream outages (502) use HTTP error codes.

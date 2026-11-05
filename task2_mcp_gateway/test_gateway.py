@@ -182,3 +182,41 @@ async def test_body_at_limit_is_accepted(gw, monkeypatch):
     monkeypatch.setattr(gateway, "MAX_BODY_BYTES", len(_json.dumps(payload).encode()) + 5)
     r = await gw.post("/mcp", json=payload, headers=auth("viewer"))
     assert r.status_code == 200 and "tools" in r.json()["result"]
+
+
+# ---- development-secret warning
+
+
+async def _startup_warnings(caplog):
+    with caplog.at_level("WARNING", logger="mcp-gateway"):
+        async with gateway.app.router.lifespan_context(gateway.app):
+            pass
+    return [r for r in caplog.records if "GATEWAY_JWT_SECRET is not set" in r.getMessage()]
+
+
+async def test_warns_at_startup_when_using_the_dev_secret(caplog, monkeypatch):
+    monkeypatch.setattr(gateway, "USING_DEV_SECRET", True)
+    warnings = await _startup_warnings(caplog)
+    assert len(warnings) == 1 and warnings[0].levelname == "WARNING"
+
+
+async def test_no_warning_when_secret_is_configured(caplog, monkeypatch):
+    monkeypatch.setattr(gateway, "USING_DEV_SECRET", False)
+    assert await _startup_warnings(caplog) == []
+
+
+@pytest.mark.parametrize(("env", "is_dev"), [(None, True), ("", True), ("x" * 40, False)])
+async def test_secret_selection_from_environment(env, is_dev, monkeypatch):
+    import importlib
+
+    if env is None:
+        monkeypatch.delenv("GATEWAY_JWT_SECRET", raising=False)
+    else:
+        monkeypatch.setenv("GATEWAY_JWT_SECRET", env)
+    try:
+        reloaded = importlib.reload(gateway)
+        assert reloaded.USING_DEV_SECRET is is_dev
+        assert (reloaded.JWT_SECRET == reloaded.DEV_JWT_SECRET) is is_dev  # empty env must not become an empty secret
+    finally:
+        monkeypatch.delenv("GATEWAY_JWT_SECRET", raising=False)
+        importlib.reload(gateway)
