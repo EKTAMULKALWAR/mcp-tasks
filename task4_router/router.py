@@ -120,6 +120,8 @@ def validate_body(body: object) -> dict:
         )
     if not all(isinstance(m, dict) for m in body["messages"]):
         raise GatewayError(400, "invalid_request_error", "invalid_body", "Each message must be an object")
+    if "max_tokens" in body and body["max_tokens"] is None:
+        del body["max_tokens"]  # explicit null means "not set": use the default, don't forward a null
     mt = body.get("max_tokens")
     if mt is not None and (not isinstance(mt, int) or isinstance(mt, bool) or mt <= 0):
         raise GatewayError(

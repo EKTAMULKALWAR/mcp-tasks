@@ -409,3 +409,31 @@ async def test_rate_limit_headers_and_request_id_on_success(tmp_path):
     r = await c.post("/v1/chat/completions", json=BODY, headers={**H, "X-Request-Id": "trace-123"})
     assert r.headers["x-ratelimit-limit"] == "50000" and int(r.headers["x-ratelimit-remaining"]) < 50000
     assert r.headers["x-request-id"] == "trace-123"
+
+
+# ---- max_tokens normalisation / validation
+
+
+async def test_null_max_tokens_means_default_and_is_not_forwarded(tmp_path):
+    seen = []
+
+    def provider(r):
+        seen.append(json.loads(r.content))
+        return httpx.Response(200, json=OK)
+
+    app, c = make(tmp_path, provider)
+    r = await c.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "max_tokens": None},
+        headers=H,
+    )
+    assert r.status_code == 200 and r.headers["x-gateway-provider"] == "primary"
+    assert "max_tokens" not in seen[0]  # a null is never passed on to the provider
+    assert await app.state.limiter.usage(tenant_hash("tenant-a-key")) == 15
+
+
+@pytest.mark.parametrize("bad", ["100", True, False, 10.5, 0, -1, [], {}])
+async def test_non_integer_or_non_positive_max_tokens_still_400(tmp_path, bad):
+    _, c = make(tmp_path, lambda r: httpx.Response(200, json=OK))
+    r = await c.post("/v1/chat/completions", json={**BODY, "max_tokens": bad}, headers=H)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_max_tokens"
