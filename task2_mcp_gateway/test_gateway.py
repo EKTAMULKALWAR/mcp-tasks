@@ -43,7 +43,20 @@ async def test_tools_list_forwarded_transparently(gw):
     assert "authorization" not in mock_downstream.app.state.last_headers
 
 
-@pytest.mark.parametrize("name", ["admin_reset_key", "Admin_reset_key", "ADMIN_x", " admin_x"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "admin_reset_key",
+        "Admin_reset_key",
+        "ADMIN_x",
+        " admin_x",
+        "\uff41dmin_x",  # fullwidth "a" + ascii rest
+        "\uff21\uff24\uff2d\uff29\uff2e_x",  # fullwidth "ADMIN" + ascii "_x"
+        "\uff41\uff44\uff4d\uff49\uff4e\uff3fx",  # fully fullwidth, including the underscore
+        "\u3000admin_x",  # ideographic space, which NFKC turns into a plain space
+        "admin_x\u0000",
+    ],
+)
 async def test_viewer_blocked_from_admin_tools_without_downstream_call(gw, name):
     r = await gw.post("/mcp", json=call(name, 9), headers=auth("viewer"))
     assert r.json() == {
@@ -252,3 +265,18 @@ async def test_deeply_nested_downstream_batch_reply_is_a_gateway_error(gw):
     r = await gw.post("/mcp", json=batch, headers=auth("viewer"))
     by_id = {m["id"]: m for m in r.json()}
     assert by_id[2]["error"]["code"] == -32001 and by_id[1]["error"]["code"] == -32003
+
+
+@pytest.mark.parametrize("name", ["\uff41dmin_x", "\uff21\uff24\uff2d\uff29\uff2e_x"])
+async def test_denial_reports_the_original_name_and_admin_is_still_allowed(gw, name):
+    r = await gw.post("/mcp", json=call(name, 3), headers=auth("viewer"))
+    assert r.json()["error"] == {"code": -32001, "message": "Unauthorized Tool Call", "data": {"tool": name}}
+    assert mock_downstream.app.state.calls == []
+    r = await gw.post("/mcp", json=call(name, 4), headers=auth("admin"))  # admins may call it; name forwarded as sent
+    assert r.json()["result"]["content"][0]["text"] == f"ran {name}"
+
+
+@pytest.mark.parametrize("name", ["administer", "admin", "\uff41dmin", "get_admin_info", "adm\u0131n_x"])
+async def test_normalisation_does_not_block_non_admin_prefixed_tools(gw, name):
+    r = await gw.post("/mcp", json=call(name, 5), headers=auth("viewer"))
+    assert r.json()["result"]["content"][0]["text"] == f"ran {name}"

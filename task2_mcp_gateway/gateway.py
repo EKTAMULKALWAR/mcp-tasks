@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import sys
+import unicodedata
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -115,9 +116,11 @@ def evaluate(msg: Any, role: str) -> dict | None:
     name = params.get("name") if isinstance(params, dict) else None
     if not isinstance(name, str) or not name:
         return rpc_error(msg.get("id"), INVALID_PARAMS, "tools/call requires string params.name")
-    # casefold + strip so "Admin_reset_key" / " admin_x" can't slip past the prefix check
-    if name.strip().casefold().startswith(ADMIN_PREFIX) and role != "admin":
-        log.warning("denied tool=%s role=%s", name, role)
+    # NFKC + strip + casefold so "Admin_reset_key", " admin_x", fullwidth "ａdmin_x" / "ＡＤＭＩＮ＿x" can't slip
+    # past the prefix check if the downstream normalises names. `name` itself stays exactly as the client sent it.
+    canonical = unicodedata.normalize("NFKC", name).strip().casefold()
+    if canonical.startswith(ADMIN_PREFIX) and role != "admin":
+        log.warning("denied tool=%r role=%s", name, role)
         return rpc_error(msg.get("id"), UNAUTHORIZED_TOOL, "Unauthorized Tool Call", {"tool": name})
     return None
 
