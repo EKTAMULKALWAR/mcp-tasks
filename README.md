@@ -3,13 +3,13 @@
 A custom **MCP server** with strict validation (Task 1), an **MCP security gateway** that does tool-level
 RBAC (Task 2), an **LLM gateway that redacts PII from a live token stream** (Task 3), and a
 **token-aware rate limiter with provider failover** on on-disk SQLite (Task 4). Every task has its own
-test suite (79 tests in total) and a scripted end-to-end demo (18 scenarios), and the whole thing runs with two commands.
+test suite (106 tests in total) and a scripted end-to-end demo (18 scenarios), and the whole thing runs with two commands.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt
 
-make test        # all four suites (79 tests)
+make test        # all four suites (106 tests)
 make demo        # starts every service on free ports, runs 18 scenarios, prints PASS/FAIL, kills the servers
 make lint        # ruff check + ruff format --check
 make typecheck   # mypy --ignore-missing-imports on each task folder
@@ -18,10 +18,10 @@ make bench       # redactor vs passthrough micro-benchmark (Task 3)
 
 | Task | Folder | Entry point | Tests |
 |---|---|---|---|
-| 1. MCP server (stdio) | `task1_mcp_server/` | `python server.py` | 4 |
-| 2. MCP security gateway | `task2_mcp_gateway/` | `python mock_downstream.py` + `python gateway.py` | 27 |
-| 3. Streaming PII guardrail | `task3_pii_stream/` | `python mock_provider.py` + `python gateway.py` | 15 |
-| 4. Rate limiter + fallback router | `task4_router/` | `python mock_providers.py <name> <port> <mode>` + `python router.py` | 33 |
+| 1. MCP server (stdio) | `task1_mcp_server/` | `python server.py` | 5 |
+| 2. MCP security gateway | `task2_mcp_gateway/` | `python mock_downstream.py` + `python gateway.py` | 32 |
+| 3. Streaming PII guardrail | `task3_pii_stream/` | `python mock_provider.py` + `python gateway.py` | 20 |
+| 4. Rate limiter + fallback router | `task4_router/` | `python mock_providers.py <name> <port> <mode>` + `python router.py` | 49 |
 
 `.github/workflows/ci.yml` is set up to run lint, type-check, tests and the demo on Python 3.11 and 3.12. I have
 verified everything locally on Python 3.12 only; the workflow itself has not been run on GitHub yet.
@@ -109,7 +109,7 @@ server with the **official SDK client** (`ClientSession` + `stdio_client`).
 **Validation.** Pydantic v2 models with `strict=True, extra="forbid"`. The same models generate the advertised
 `inputSchema`, so the contract and the enforcement cannot drift.
 
-Edge cases handled (each is a test case): `CUST-1`, lowercase `cust-00001`, six digits, integer `customer_id`,
+Edge cases handled (each is a test case): `CUST-1`, lowercase `cust-00001`, six digits, non-ASCII digits (Arabic-Indic and fullwidth, which a `\d` regex would accept), integer `customer_id`,
 missing field, extra field, amount `-5` / `0` / `"10"` (string) / `true` (bool is an int in Python) / `10.123`
 (3 decimals) / `1000000.01` (above cap), reason shorter than 10, reason that is 10 characters only because of
 whitespace padding, unknown tool; and the SDK-client test checks that the session keeps working after protocol errors.
@@ -285,7 +285,7 @@ upstream failures and assert none reach the client.
 
 Edge cases handled (tests): failover on 429 and on timeout (bounded wall-clock), both providers failing (503,
 reservation released), 4xx not failed over, request larger than the whole window (400 `request_too_large`, not a
-retryable 429), non-object `messages` (400, not 500), SQLite error from the limiter (sanitized 503 + `Retry-After`),
+retryable 429), non-object `messages` (400, not 500), `"max_tokens": null` (treated as unset) and string/bool/float/zero/negative `max_tokens` (400), provider 401/403 (failover), other 4xx (not retried), SQLite error from the limiter (sanitized 503 + `Retry-After`),
 malformed provider body (failover), `stream: true` (400 `stream_unsupported`), tenant isolation, window eviction with an injected clock, state surviving a restart, sweeper batching; registry:
 unknown key (401, zero database rows, no provider call), two keys of one tenant sharing a budget, keys of different
 lengths, invalid/plaintext key files, dev mode warning once.
@@ -300,6 +300,13 @@ lengths, invalid/plaintext key files, dev mode warning once.
 - Task 4: idle tenants' rows were never evicted; now handled by the sweeper.
 - Task 3: invalid JSON bodies caused a 500; non-object SSE events crashed the stream; both handled.
 - Task 3: the stream contract (no content after `finish_reason`, no empty chunks) is enforced and covered by a test.
+- Task 1: `customer_id` used `\d`, which also matches non-ASCII digits (`CUST-١٢٣٤٥`, `CUST-１２３４５`); now `[0-9]{5}`.
+- Task 4: `"max_tokens": null` passed validation and then crashed the cost calculation (500); `null` now means "not set".
+- Task 4: a provider 401/403 (the gateway's own credentials were rejected) was reported to the client as a 400 and not
+  failed over; it now fails over to the secondary.
+- Task 3: error responses had a different, ad-hoc shape and exposed the provider's status code; they now use the Task 4
+  shape with a request id.
+- Task 2: with `GATEWAY_JWT_SECRET` unset the gateway silently used a public development secret; it now logs a warning.
 
 ## Trade-offs and what I'd do in production
 
