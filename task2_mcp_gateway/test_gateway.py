@@ -33,8 +33,11 @@ def auth(role):
 
 
 async def test_tools_list_forwarded_transparently(gw):
-    r = await gw.post("/mcp", json={"jsonrpc": "2.0", "id": 7, "method": "tools/list"}, headers=auth("viewer"))
+    payload = {"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {"cursor": "abc"}}
+    r = await gw.post("/mcp", json=payload, headers=auth("viewer"))
     assert r.json()["result"]["tools"][1]["name"] == "admin_reset_key"
+    # the downstream received exactly the payload the client sent (one call, nothing added or dropped)
+    assert mock_downstream.app.state.calls == [payload]
     assert r.headers["mcp-session-id"] == "sess-123"
     # client credential is not leaked downstream
     assert "authorization" not in mock_downstream.app.state.last_headers
