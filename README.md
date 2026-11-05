@@ -3,13 +3,13 @@
 A custom **MCP server** with strict validation (Task 1), an **MCP security gateway** that does tool-level
 RBAC (Task 2), an **LLM gateway that redacts PII from a live token stream** (Task 3), and a
 **token-aware rate limiter with provider failover** on on-disk SQLite (Task 4). Every task has its own
-test suite (106 tests in total) and a scripted end-to-end demo (18 scenarios), and the whole thing runs with two commands.
+test suite (125 tests in total) and a scripted end-to-end demo (18 scenarios), and the whole thing runs with two commands.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt
 
-make test        # all four suites (106 tests)
+make test        # all four suites (125 tests)
 make demo        # starts every service on free ports, runs 18 scenarios, prints PASS/FAIL, kills the servers
 make lint        # ruff check + ruff format --check
 make typecheck   # mypy --ignore-missing-imports on each task folder
@@ -19,9 +19,9 @@ make bench       # redactor vs passthrough micro-benchmark (Task 3)
 | Task | Folder | Entry point | Tests |
 |---|---|---|---|
 | 1. MCP server (stdio) | `task1_mcp_server/` | `python server.py` | 5 |
-| 2. MCP security gateway | `task2_mcp_gateway/` | `python mock_downstream.py` + `python gateway.py` | 32 |
-| 3. Streaming PII guardrail | `task3_pii_stream/` | `python mock_provider.py` + `python gateway.py` | 20 |
-| 4. Rate limiter + fallback router | `task4_router/` | `python mock_providers.py <name> <port> <mode>` + `python router.py` | 49 |
+| 2. MCP security gateway | `task2_mcp_gateway/` | `python mock_downstream.py` + `python gateway.py` | 47 |
+| 3. Streaming PII guardrail | `task3_pii_stream/` | `python mock_provider.py` + `python gateway.py` | 22 |
+| 4. Rate limiter + fallback router | `task4_router/` | `python mock_providers.py <name> <port> <mode>` + `python router.py` | 51 |
 
 `.github/workflows/ci.yml` is set up to run lint, type-check, tests and the demo on Python 3.11 and 3.12. I have
 verified everything locally on Python 3.12 only; the workflow itself has not been run on GitHub yet.
@@ -147,13 +147,14 @@ forwarded downstream** (tested), and
 
 **Fine-grained, method-level authorization logic and clean error handling.** The role comes from a signed
 HS256 JWT (signature, `exp` and `role ∈ {admin, viewer}` are all required). Anything doubtful is rejected
-(fail closed). The `admin_` check is case- and whitespace-insensitive, so `Admin_reset_key` and ` admin_x` cannot
-slip through. Tests prove that a denied call makes **zero** downstream calls.
+(fail closed). The `admin_` check is case-, whitespace- and Unicode-compatibility-insensitive (NFKC, then strip, then casefold), so
+`Admin_reset_key`, ` admin_x`, fullwidth `ａdmin_x` / `ＡＤＭＩＮ_x` and an ideographic-space prefix cannot slip
+through even if a downstream server normalizes tool names; the denial's `data.tool` echoes the name exactly as sent. Tests prove that a denied call makes **zero** downstream calls.
 
 Edge cases handled (tests): `alg: none` token, right key with HS512/HS384 (algorithm confusion), tampered
 signature, expired token, wrong secret, unknown role, missing/`Basic`/empty bearer, malformed JSON, empty batch,
 missing `jsonrpc`, non-string tool name, denied notification alone and inside a batch, oversized body (declared
-and chunked without `Content-Length`), body exactly at the limit, downstream down.
+and chunked without `Content-Length`), body exactly at the limit, deeply nested JSON (`-32700`, also in a downstream batch reply), downstream down.
 
 > **Secret handling:** tokens are verified with `GATEWAY_JWT_SECRET`. If it is unset (or empty) the gateway falls back
 > to a development secret that is public in this repository, so anyone could mint an admin token; it logs a `WARNING`
@@ -307,6 +308,11 @@ lengths, invalid/plaintext key files, dev mode warning once.
 - Task 3: error responses had a different, ad-hoc shape and exposed the provider's status code; they now use the Task 4
   shape with a request id.
 - Task 2: with `GATEWAY_JWT_SECRET` unset the gateway silently used a public development secret; it now logs a warning.
+- Tasks 2, 3, 4: a deeply nested JSON body (100 KB of `[`, well under the size cap) raised an unhandled `RecursionError`:
+  a bare non-JSON 500 in Task 2, a 500 in Tasks 3 and 4. It is now `-32700` (Task 2) or `400 invalid_json` (Tasks 3, 4);
+  the same guard covers a deeply nested provider/downstream reply.
+- Task 2: fullwidth lookalikes such as `ａdmin_x` or `ＡＤＭＩＮ_x` were not recognised as `admin_` tools, which would be a
+  bypass against a downstream that normalizes names; names are now NFKC-normalized before the prefix check.
 
 ## Trade-offs and what I'd do in production
 
