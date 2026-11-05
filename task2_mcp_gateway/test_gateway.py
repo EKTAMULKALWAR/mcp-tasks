@@ -223,3 +223,32 @@ async def test_secret_selection_from_environment(env, is_dev, monkeypatch):
     finally:
         monkeypatch.delenv("GATEWAY_JWT_SECRET", raising=False)
         importlib.reload(gateway)
+
+
+# ---- absurdly deep JSON nesting is a parse error, not a crash
+
+DEEP = b"[" * 100_000  # 100 KB: far below the 1 MiB body cap, far beyond what the JSON parser can nest
+
+
+async def test_deeply_nested_body_is_a_jsonrpc_parse_error(gw):
+    r = await gw.post("/mcp", content=DEEP, headers=auth("admin"))
+    assert r.status_code == 200 and r.json()["error"]["code"] == -32700
+    assert mock_downstream.app.state.calls == []
+
+
+async def test_moderately_nested_body_still_works(gw):
+    depth = 500
+    body = ('{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"x":' + "[" * depth + "]" * depth + "}}").encode()
+    r = await gw.post("/mcp", content=body, headers=auth("viewer"))
+    assert r.status_code == 200 and "tools" in r.json()["result"]
+
+
+async def test_deeply_nested_downstream_batch_reply_is_a_gateway_error(gw):
+    def deep_reply(request):
+        return httpx.Response(200, content=DEEP, headers={"content-type": "application/json"})
+
+    gateway.client = httpx.AsyncClient(transport=httpx.MockTransport(deep_reply))
+    batch = [call("get_weather", 1), call("admin_reset_key", 2)]  # mixed: gateway must merge the downstream reply
+    r = await gw.post("/mcp", json=batch, headers=auth("viewer"))
+    by_id = {m["id"]: m for m in r.json()}
+    assert by_id[2]["error"]["code"] == -32001 and by_id[1]["error"]["code"] == -32003

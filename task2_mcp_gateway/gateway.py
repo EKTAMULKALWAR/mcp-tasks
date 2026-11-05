@@ -196,7 +196,7 @@ async def mcp_endpoint(req: Request) -> Response:
         )
     try:
         payload = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):  # RecursionError: absurdly deep nesting
         return JSONResponse(rpc_error(None, PARSE_ERROR, "Parse error"))
 
     is_batch = isinstance(payload, list)
@@ -242,7 +242,7 @@ async def mcp_endpoint(req: Request) -> Response:
     await upstream.aclose()
     try:
         downstream_results = json.loads(downstream_body) if downstream_body else []
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         downstream_results = [
             rpc_error(m.get("id"), UPSTREAM_ERROR, "Bad downstream response") for m in to_forward if "id" in m
         ]
