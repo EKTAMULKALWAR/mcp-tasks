@@ -203,6 +203,12 @@ measures the cost in-process (no network); a typical run:
 The 20 ms figure is a *simulated* upstream pace, not a measurement of a real provider. In plain prose the delay
 is about one token (the trailing partial word is held until a boundary arrives).
 
+**Errors.** Task 3 uses the same error shape as Task 4, `{"error": {"type", "code", "message", "request_id"}}`
+(also as the SSE error event if the provider stream breaks mid-way), with an `X-Request-Id` header. Provider
+statuses, bodies, addresses and stack traces are logged with the request id and never returned: an unreachable
+provider is `502 provider_unavailable`, any provider error or non-JSON body is `502 provider_error`, an unhandled
+exception is a generic `500 internal_error`.
+
 Edge cases handled (tests): PII split across chunk boundaries (300 random chunkings for each of 6 sample texts), invalid SSN areas, Luhn-invalid digit
 runs, multiple choices interleaved, role-only and finish-only events, upstream mid-stream error (sanitized
 error event, upstream closed), non-object SSE events, invalid JSON request body (400),

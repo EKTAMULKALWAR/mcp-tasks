@@ -23,13 +23,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from redactor import StreamRedactor, redact
 
@@ -51,12 +54,51 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="LLM Gateway — PII streaming guardrail", lifespan=lifespan)
 
 
+# ---- standard gateway error shape (same as the Task 4 router):
+#      {"error": {"type", "code", "message", "request_id"}}  -- never provider statuses, bodies or stack traces
+
+_SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def new_request_id(supplied: str | None = None) -> str:
+    """Honour a well-formed client X-Request-Id, otherwise generate one."""
+    return supplied if supplied and _SAFE_REQUEST_ID.match(supplied) else f"req_{uuid.uuid4().hex[:16]}"
+
+
+def error_body(type_: str, code: str, message: str, request_id: str) -> dict:
+    return {"error": {"type": type_, "code": code, "message": message, "request_id": request_id}}
+
+
+def error_response(status: int, type_: str, code: str, message: str, request_id: str) -> JSONResponse:
+    return JSONResponse(
+        error_body(type_, code, message, request_id), status_code=status, headers={"X-Request-Id": request_id}
+    )
+
+
+@app.middleware("http")
+async def request_id_mw(request: Request, call_next):
+    request.state.request_id = new_request_id(request.headers.get("x-request-id"))
+    try:
+        return await call_next(request)
+    except Exception:
+        log.exception("[%s] unhandled error", request.state.request_id)  # trace to the log only
+        return error_response(
+            500, "internal_error", "internal_error", "An internal error occurred", request.state.request_id
+        )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error(request: Request, exc: StarletteHTTPException):
+    message = "Not found" if exc.status_code == 404 else "Request error"
+    return error_response(exc.status_code, "invalid_request_error", "http_error", message, request.state.request_id)
+
+
 def sse(obj: dict | str) -> bytes:
     data = obj if isinstance(obj, str) else json.dumps(obj, separators=(",", ":"))
     return f"data: {data}\n\n".encode()
 
 
-async def redacted_stream(upstream: httpx.Response) -> AsyncIterator[bytes]:
+async def redacted_stream(upstream: httpx.Response, request_id: str | None = None) -> AsyncIterator[bytes]:
     redactors: dict[int, StreamRedactor] = {}
     last_meta: dict = {}
     try:
@@ -109,49 +151,58 @@ async def redacted_stream(upstream: httpx.Response) -> AsyncIterator[bytes]:
         yield sse("[DONE]")
     except httpx.HTTPError as exc:
         log.error("upstream stream broke: %s", exc.__class__.__name__)
-        yield sse({"error": {"type": "upstream_error", "message": "Upstream stream interrupted"}})
+        yield sse(
+            error_body(
+                "upstream_error",
+                "upstream_stream_interrupted",
+                "Upstream stream interrupted",
+                request_id or new_request_id(),
+            )
+        )
     finally:
         await upstream.aclose()
 
 
 @app.post("/v1/chat/completions")
 async def completions(req: Request):
+    rid = req.state.request_id
     try:
         body = await req.json()
     except ValueError:
-        return JSONResponse(
-            {"error": {"type": "invalid_request_error", "message": "Body is not valid JSON"}}, status_code=400
-        )
+        return error_response(400, "invalid_request_error", "invalid_json", "Body is not valid JSON", rid)
     if not isinstance(body, dict):
-        return JSONResponse(
-            {"error": {"type": "invalid_request_error", "message": "Body must be a JSON object"}}, status_code=400
-        )
+        return error_response(400, "invalid_request_error", "invalid_body", "Body must be a JSON object", rid)
     headers = {"Authorization": f"Bearer {PROVIDER_KEY}"} if PROVIDER_KEY else {}
     try:
         upstream = await client.send(
             client.build_request("POST", PROVIDER_URL, json=body, headers=headers), stream=True
         )
-    except httpx.HTTPError:
-        return JSONResponse(
-            {"error": {"type": "upstream_unavailable", "message": "Provider unavailable"}}, status_code=502
-        )
+    except httpx.HTTPError as exc:
+        log.warning("[%s] provider unreachable: %r", rid, exc)
+        return error_response(502, "upstream_unavailable", "provider_unavailable", "Provider unavailable", rid)
     if upstream.status_code != 200:
+        log.warning("[%s] provider answered %d", rid, upstream.status_code)  # logged, never returned
         await upstream.aclose()
-        return JSONResponse({"error": {"type": "upstream_error", "status": upstream.status_code}}, status_code=502)
+        return error_response(502, "upstream_error", "provider_error", "The model provider returned an error", rid)
 
     if not body.get("stream"):
-        data = json.loads(await upstream.aread())
-        await upstream.aclose()
+        try:
+            data = json.loads(await upstream.aread())
+        except ValueError:
+            log.warning("[%s] provider returned a non-JSON body", rid)
+            return error_response(502, "upstream_error", "provider_error", "The model provider returned an error", rid)
+        finally:
+            await upstream.aclose()
         for c in data.get("choices", []):
             msg = c.get("message") or {}
             if isinstance(msg.get("content"), str):
                 msg["content"] = redact(msg["content"])
-        return JSONResponse(data)
+        return JSONResponse(data, headers={"X-Request-Id": rid})
 
     return StreamingResponse(
-        redacted_stream(upstream),
+        redacted_stream(upstream, rid),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Request-Id": rid},
     )
 
 

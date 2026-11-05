@@ -190,3 +190,80 @@ async def test_invalid_json_body_is_400_and_non_object_events_are_skipped():
         ]
     )
     assert b'"ok "' in out
+
+
+# ---- standard error shape: {"error": {"type", "code", "message", "request_id"}}, nothing from the provider
+
+ERROR_KEYS = {"type", "code", "message", "request_id"}
+
+
+def _gw_client(handler):
+    gateway.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://gw")
+
+
+async def test_client_errors_use_the_standard_shape():
+    async with _gw_client(lambda r: httpx.Response(200, json={})) as c:
+        cases = [
+            (await c.post("/v1/chat/completions", content=b"{nope"), 400, "invalid_json"),
+            (await c.post("/v1/chat/completions", json=[1]), 400, "invalid_body"),
+            (await c.get("/nope"), 404, "http_error"),
+        ]
+    for r, status, code in cases:
+        assert r.status_code == status
+        err = r.json()["error"]
+        assert set(err) == ERROR_KEYS and err["code"] == code
+        assert r.headers["x-request-id"] == err["request_id"]
+
+
+async def test_provider_failures_are_sanitized_and_carry_no_status_numbers():
+    def leaky_503(r):
+        return httpx.Response(503, text="Traceback (most recent call last): db password=hunter2")
+
+    async with _gw_client(leaky_503) as c:
+        r = await c.post("/v1/chat/completions", json={"stream": True, "messages": []})
+    assert r.status_code == 502 and set(r.json()["error"]) == ERROR_KEYS
+    assert r.json()["error"]["code"] == "provider_error"
+    assert "503" not in r.text and "hunter2" not in r.text and "Traceback" not in r.text
+
+    def unreachable(r):
+        raise httpx.ConnectError("connect to 10.0.0.5:443 refused")
+
+    async with _gw_client(unreachable) as c:
+        r = await c.post("/v1/chat/completions", json={"stream": True, "messages": []})
+    assert r.status_code == 502 and set(r.json()["error"]) == ERROR_KEYS
+    assert r.json()["error"]["code"] == "provider_unavailable" and "10.0.0.5" not in r.text
+
+    async with _gw_client(lambda r: httpx.Response(200, text="<html>not json</html>")) as c:
+        r = await c.post("/v1/chat/completions", json={"messages": []})  # non-streaming path
+    assert r.status_code == 502 and r.json()["error"]["code"] == "provider_error" and "html" not in r.text
+
+
+async def test_unhandled_exception_is_a_generic_500_with_standard_shape():
+    def boom(r):
+        raise RuntimeError("SECRET internal detail")
+
+    async with _gw_client(boom) as c:
+        r = await c.post("/v1/chat/completions", json={"stream": True, "messages": []})
+    assert r.status_code == 500 and set(r.json()["error"]) == ERROR_KEYS
+    assert r.json()["error"]["code"] == "internal_error" and "SECRET" not in r.text
+
+
+async def test_request_id_is_honoured_when_well_formed_and_replaced_when_not():
+    async with _gw_client(lambda r: httpx.Response(200, json={})) as c:
+        ok = await c.post("/v1/chat/completions", content=b"{", headers={"X-Request-Id": "trace-123"})
+        bad = await c.post("/v1/chat/completions", content=b"{", headers={"X-Request-Id": "x\ninjected: 1 " + "a" * 80})
+    assert ok.json()["error"]["request_id"] == "trace-123"
+    assert bad.json()["error"]["request_id"].startswith("req_")
+
+
+async def test_mid_stream_error_event_uses_the_standard_shape():
+    class Broken(FakeUpstream):
+        async def aiter_lines(self):
+            yield _evt(0, "hi ")
+            raise httpx.ReadError("secret upstream detail 10.0.0.9")
+
+    out = b"".join([c async for c in gateway.redacted_stream(Broken([]), "req_abc")])
+    event = json.loads(out.decode().strip().splitlines()[-1][5:])
+    assert set(event["error"]) == ERROR_KEYS and event["error"]["request_id"] == "req_abc"
+    assert event["error"]["code"] == "upstream_stream_interrupted" and b"10.0.0.9" not in out
