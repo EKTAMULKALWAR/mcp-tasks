@@ -471,3 +471,15 @@ async def test_other_4xx_still_a_non_retried_400(tmp_path, status):
     )
     r = await c.post("/v1/chat/completions", json=BODY, headers=H)
     assert r.status_code == 400 and r.json()["error"]["code"] == "upstream_rejected" and not calls
+
+
+# ---- absurdly deep JSON nesting is a 400, not a 500
+
+
+@pytest.mark.parametrize("keys", [None, {"acme": key_digest("tenant-a-key")}], ids=["dev-mode", "registry"])
+async def test_deeply_nested_body_is_400_invalid_json(tmp_path, keys):
+    app, c = make(tmp_path, lambda r: httpx.Response(200, json=OK), keys=keys)
+    r = await c.post("/v1/chat/completions", content=b"[" * 100_000, headers=H)  # 100 KB of nesting
+    assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_json"
+    assert set(r.json()["error"]) == {"type", "code", "message", "request_id"}
+    assert _rows(app) == 0

@@ -329,7 +329,7 @@ def create_app(settings: Settings | None = None, client: httpx.AsyncClient | Non
         tenant = authenticate(key.strip())
         try:
             body = validate_body(json.loads(await request.body()))
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):  # RecursionError: absurdly deep nesting
             raise GatewayError(400, "invalid_request_error", "invalid_json", "Body is not valid JSON")
         if body.get("stream"):
             raise GatewayError(
