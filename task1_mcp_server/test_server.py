@@ -140,3 +140,39 @@ async def test_official_sdk_client_end_to_end():
     assert bad_id.code == -32602 and bad_amount.code == -32602
     assert [e["field"] for e in bad_amount.data["errors"]] == ["amount"]
     assert not again.is_error and "Alan Turing" in again.content[0].text
+
+
+# ---- -32603: an unexpected failure inside a handler (in-process: the real Server, via the SDK's in-memory client)
+
+
+class _ExplodingCustomers(dict):
+    def get(self, *a, **k):
+        raise RuntimeError("SECRET db password=hunter2 at 10.0.0.7")
+
+    __contains__ = get  # the refund path uses `in`
+
+
+async def test_unexpected_handler_failure_is_internal_error_minus_32603(monkeypatch, caplog):
+    from mcp import Client
+    from mcp.shared.exceptions import MCPError
+
+    import server as srv
+
+    monkeypatch.setattr(srv, "CUSTOMERS", _ExplodingCustomers())
+    with caplog.at_level("ERROR", logger="customer-mcp"):
+        async with Client(srv.server) as client:
+            with pytest.raises(MCPError) as lookup:
+                await client.call_tool("get_customer_record", {"customer_id": "CUST-00001"})
+            with pytest.raises(MCPError) as refund:
+                await client.call_tool(
+                    "trigger_refund", {"customer_id": "CUST-00001", "amount": 5, "reason": "damaged item"}
+                )
+            # the session survives, and validation errors still map to -32602
+            with pytest.raises(MCPError) as bad:
+                await client.call_tool("get_customer_record", {"customer_id": "nope"})
+    for err in (lookup.value, refund.value):
+        assert err.code == -32603 and err.message == "Internal error"
+        assert "hunter2" not in str(err) and "10.0.0.7" not in str(err) and not err.data
+    assert bad.value.code == -32602
+    # the detail went to the log (stderr), with the stack trace
+    assert "hunter2" in caplog.text and "Traceback" in caplog.text

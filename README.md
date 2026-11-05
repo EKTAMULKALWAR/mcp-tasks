@@ -100,7 +100,8 @@ Tests spawn the real process and `json.loads` every stdout line, so any stray by
 
 **Protocol Compliance.** Schema violations map to `-32602 Invalid params` with a structured `data.errors` list
 (field, message, type — never the raw input). An unknown tool is also `-32602`. An unexpected failure is
-`-32603` with a generic message and the stack trace goes to stderr (implemented, but not exercised by a test). Business outcomes such as "customer not found"
+`-32603` with a generic message; the stack trace goes to the log on stderr (tested in-process with the SDK's in-memory
+client: the error is `-32603 Internal error`, no detail reaches the client, and the session keeps working). Business outcomes such as "customer not found"
 are returned as `isError: true` tool results, the MCP convention for errors the model should see. Validation
 runs before any side effect. Compliance is checked two ways: raw wire tests, and a test that drives the real
 server with the **official SDK client** (`ClientSession` + `stdio_client`).
@@ -139,8 +140,9 @@ response body**, even when denied. **Batches** are split: denied entries are ans
 ones are forwarded as a smaller batch, and results are merged.
 
 **Proxy middleware construction and HTTP request/response forwarding.** Responses are streamed back untouched
-(the code path is the same for JSON and SSE bodies; only JSON is covered by tests). Hop-by-hop headers are stripped in
-the code, **the client's bearer token is never forwarded downstream** (tested), and
+(*design property, not covered by tests:* the code path is the same for JSON and SSE bodies, and only JSON bodies are
+tested). Hop-by-hop headers are stripped (*design property, not covered by tests*); **the client's bearer token is never
+forwarded downstream** (tested), and
 `Mcp-Session-Id` passes through. If the downstream is unreachable the client gets 502 + `-32003`.
 
 **Fine-grained, method-level authorization logic and clean error handling.** The role comes from a signed
@@ -241,9 +243,11 @@ fallback. A configurable **total deadline** (default 6 s, `GATEWAY_TOTAL_TIMEOUT
 combined: each attempt gets `min(its timeout, time left)`, and the secondary is skipped if nothing is left (503, no wasted attempt). The
 limiter reserves tokens *before* the call and settles to real usage afterwards, so a burst of concurrent requests
 cannot all slip past the check; the test fires 30 concurrent requests at a 1,000-token budget and exactly 9 are
-admitted. Check + evict + insert is one `BEGIN IMMEDIATE` transaction, atomic across tasks, threads and processes
-sharing the file; SQLite calls run in `asyncio.to_thread`. The release of a failed request is shielded, so a
-client disconnect cannot leak a reservation.
+admitted. Check + evict + insert is one `BEGIN IMMEDIATE` transaction: atomic across asyncio tasks (tested with the 30
+concurrent requests above) and, by SQLite's locking semantics, across threads and processes sharing the file (*design
+property, not covered by tests*). SQLite calls run in `asyncio.to_thread`. The release of a failed request (tested) is
+shielded from cancellation, so a client disconnect should not leak a reservation (*design property, not covered by
+tests*).
 
 **Accurate rate-limiter state eviction and token tracking logic.** A true sliding *log* `(tenant, ts, tokens)`.
 Expired rows are deleted in the same transaction as the check, so sums are exact. Tenants who stop calling are
@@ -256,7 +260,8 @@ hex of its API key (or a list of hashes, to run several keys per tenant, e.g. du
 `{"acme": "<sha256 hex>", "globex": ["<hex>", "<hex>"]}`. Build entries with `python hash_key.py <key>`; plaintext
 keys are never stored, and the loader rejects anything that is not a 64-char hex digest (the app refuses to start).
 The presented key is hashed and compared with `hmac.compare_digest` against every stored digest with no early exit,
-so keys of any length work and timing does not reveal which entry matched. An unknown key gets `401 invalid_api_key`
+so keys of any length work (tested). The lookup does constant work and uses `hmac.compare_digest`, so timing should not
+reveal which entry matched (*design property, not covered by tests*). An unknown key gets `401 invalid_api_key`
 (a missing header is `401 missing_api_key`) **before** the body is parsed, any rate-limit check, or any database
 write. The limiter is keyed on the **tenant name**, so all keys of a tenant share one budget and rotating made-up
 keys gains nothing. **Development mode:** if `TENANT_KEYS_FILE` is unset, any bearer string is accepted and is its
