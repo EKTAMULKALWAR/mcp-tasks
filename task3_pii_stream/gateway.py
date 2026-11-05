@@ -168,7 +168,7 @@ async def completions(req: Request):
     rid = req.state.request_id
     try:
         body = await req.json()
-    except ValueError:
+    except (ValueError, RecursionError):  # RecursionError: absurdly deep nesting
         return error_response(400, "invalid_request_error", "invalid_json", "Body is not valid JSON", rid)
     if not isinstance(body, dict):
         return error_response(400, "invalid_request_error", "invalid_body", "Body must be a JSON object", rid)
@@ -188,7 +188,7 @@ async def completions(req: Request):
     if not body.get("stream"):
         try:
             data = json.loads(await upstream.aread())
-        except ValueError:
+        except (ValueError, RecursionError):
             log.warning("[%s] provider returned a non-JSON body", rid)
             return error_response(502, "upstream_error", "provider_error", "The model provider returned an error", rid)
         finally:

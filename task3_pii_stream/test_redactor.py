@@ -267,3 +267,21 @@ async def test_mid_stream_error_event_uses_the_standard_shape():
     event = json.loads(out.decode().strip().splitlines()[-1][5:])
     assert set(event["error"]) == ERROR_KEYS and event["error"]["request_id"] == "req_abc"
     assert event["error"]["code"] == "upstream_stream_interrupted" and b"10.0.0.9" not in out
+
+
+# ---- absurdly deep JSON nesting is a 400 / 502, not a crash
+
+DEEP = b"[" * 100_000  # 100 KB of nesting: more than the JSON parser can handle
+
+
+async def test_deeply_nested_request_body_is_400_invalid_json():
+    async with _gw_client(lambda r: httpx.Response(200, json={})) as c:
+        r = await c.post("/v1/chat/completions", content=DEEP)
+    assert r.status_code == 400 and set(r.json()["error"]) == ERROR_KEYS
+    assert r.json()["error"]["code"] == "invalid_json"
+
+
+async def test_deeply_nested_provider_reply_is_a_sanitized_502():
+    async with _gw_client(lambda r: httpx.Response(200, content=DEEP)) as c:
+        r = await c.post("/v1/chat/completions", json={"messages": []})  # non-streaming path parses the reply
+    assert r.status_code == 502 and r.json()["error"]["code"] == "provider_error"
