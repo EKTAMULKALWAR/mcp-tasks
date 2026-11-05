@@ -58,6 +58,9 @@ BAD = [
     ("get_customer_record", {"customer_id": "cust-00001"}),
     ("get_customer_record", {"customer_id": "CUST-000011"}),
     ("get_customer_record", {"customer_id": 12345}),
+    ("get_customer_record", {"customer_id": "CUST-\u0661\u0662\u0663\u0664\u0665"}),  # Arabic-Indic digits
+    ("get_customer_record", {"customer_id": "CUST-\uff11\uff12\uff13\uff14\uff15"}),  # fullwidth digits
+    ("trigger_refund", {"customer_id": "CUST-\u0661\u0662\u0663\u0664\u0665", "amount": 5, "reason": "damaged item"}),
     ("get_customer_record", {}),
     ("get_customer_record", {"customer_id": "CUST-00001", "extra": 1}),
     ("trigger_refund", {"customer_id": "CUST-00001", "amount": -5, "reason": "damaged item"}),
@@ -129,7 +132,7 @@ async def test_official_sdk_client_end_to_end():
 
     names, schemas, ok, refund, missing, bad_id, bad_amount, again = await _with_sdk_client(scenario)
     assert names == {"get_customer_record", "trigger_refund"}
-    assert schemas["get_customer_record"]["properties"]["customer_id"]["pattern"] == r"^CUST-\d{5}$"
+    assert schemas["get_customer_record"]["properties"]["customer_id"]["pattern"] == r"^CUST-[0-9]{5}$"
     assert schemas["trigger_refund"]["properties"]["reason"]["minLength"] == 10
     assert not ok.is_error and "Ada Lovelace" in ok.content[0].text
     assert "Refund RF-" in refund.content[0].text

@@ -44,7 +44,8 @@ log = logging.getLogger("customer-mcp")
 
 # ---------------------------------------------------------------- schemas
 
-CUSTOMER_ID_PATTERN = r"^CUST-\d{5}$"
+# [0-9], not \d: \d also matches non-ASCII digits (Arabic-Indic, fullwidth, ...)
+CUSTOMER_ID_PATTERN = r"^CUST-[0-9]{5}$"
 
 
 class _Strict(BaseModel):
