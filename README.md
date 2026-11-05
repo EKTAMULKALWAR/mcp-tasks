@@ -271,7 +271,8 @@ tenant_token_limit` with an exact `Retry-After`. Successful responses carry `X-R
 `X-RateLimit-Remaining`, `X-Gateway-Provider` and `X-Request-Id`.
 
 **Graceful fallback mechanics and standardized error sanitization.** Failover on 429, timeout, transport error,
-5xx, or a malformed body; **not** on other 4xx (a bad request would just be billed twice). Every error has the same
+5xx, a malformed body, or a provider **401/403** (the gateway's own credentials for that provider are bad, which is
+not the client's fault; it is logged as an error); **not** on other 4xx (a bad request would just be billed twice). Every error has the same
 shape, `{"error": {"type", "code", "message", "request_id"}}`. Upstream bodies and stack traces are logged with the
 request id and never returned; a catch-all middleware turns any unhandled exception into a generic 500, and
 unknown routes (404) use the same shape. Tests plant secrets (passwords, internal IPs, tracebacks) in

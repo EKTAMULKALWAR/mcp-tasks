@@ -5,7 +5,8 @@ Flow per request:
      (rejected before any rate-limit check or database write)
   2. estimate cost, atomically reserve in SQLite window  -> 429 gateway error + Retry-After
   3. try providers in order; each attempt is bounded by asyncio.timeout(3.0s).
-     Fail over on: 429, timeout, connection error, 5xx.  Do NOT fail over on other 4xx
+     Fail over on: 429, timeout, connection error, 5xx, and 401/403 (the *gateway's* credentials
+     to that provider are bad -- not the client's fault).  Do NOT fail over on other 4xx
      (the request itself is bad — a second provider would just bill for the same error).
   4. settle reservation to real usage (or release it if nothing succeeded)
   5. any failure -> standardized payload; upstream bodies/stack traces only go to the log
@@ -97,6 +98,9 @@ def error_response(err: GatewayError, request_id: str) -> JSONResponse:
     )
 
 
+PROVIDER_AUTH_FAILURES = {401, 403}
+
+
 class RetryableUpstream(Exception):
     """Internal signal: this provider failed in a way that justifies trying the next."""
 
@@ -155,6 +159,10 @@ class ModelRouter:
             log.warning("[%s] %s transport error: %r", request_id, p.name, exc)
             raise RetryableUpstream("transport")
 
+        if resp.status_code in PROVIDER_AUTH_FAILURES:
+            # our key for this provider is wrong/expired: the client did nothing wrong, so try the next one
+            log.error("[%s] %s rejected the gateway's credentials (%d)", request_id, p.name, resp.status_code)
+            raise RetryableUpstream(str(resp.status_code))
         if resp.status_code == 429 or resp.status_code >= 500:
             log.warning("[%s] %s returned %d: %.200s", request_id, p.name, resp.status_code, resp.text)
             raise RetryableUpstream(str(resp.status_code))

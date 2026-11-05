@@ -437,3 +437,37 @@ async def test_non_integer_or_non_positive_max_tokens_still_400(tmp_path, bad):
     _, c = make(tmp_path, lambda r: httpx.Response(200, json=OK))
     r = await c.post("/v1/chat/completions", json={**BODY, "max_tokens": bad}, headers=H)
     assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_max_tokens"
+
+
+# ---- provider auth failures (our credentials) fail over; other 4xx do not
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_provider_auth_failure_fails_over_to_secondary(tmp_path, status):
+    _, c = make(tmp_path, lambda r: httpx.Response(status, json={"error": "invalid api key sk-LEAK"}))
+    r = await c.post("/v1/chat/completions", json=BODY, headers=H)
+    assert r.status_code == 200 and r.headers["x-gateway-provider"] == "secondary"
+
+
+async def test_both_providers_rejecting_our_credentials_is_a_sanitized_503(tmp_path):
+    app, c = make(
+        tmp_path,
+        lambda r: httpx.Response(401, text="bad key sk-LEAK-1"),
+        lambda r: httpx.Response(403, text="forbidden sk-LEAK-2"),
+    )
+    r = await c.post("/v1/chat/completions", json=BODY, headers=H)
+    assert r.status_code == 503 and r.json()["error"]["code"] == "all_providers_failed"
+    assert "sk-LEAK" not in r.text and "401" not in r.text and "403" not in r.text
+    assert await app.state.limiter.usage(tenant_hash("tenant-a-key")) == 0  # reservation released
+
+
+@pytest.mark.parametrize("status", [400, 404, 408, 422])
+async def test_other_4xx_still_a_non_retried_400(tmp_path, status):
+    calls = []
+    _, c = make(
+        tmp_path,
+        lambda r: httpx.Response(status, json={"internal": "x"}),
+        lambda r: calls.append(1) or httpx.Response(200, json=OK),
+    )
+    r = await c.post("/v1/chat/completions", json=BODY, headers=H)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "upstream_rejected" and not calls
